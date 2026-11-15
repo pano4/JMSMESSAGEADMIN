@@ -1,9 +1,9 @@
 /*
- * Automation script: JMSMSGADMIN   (language: groovy, no launch point)
+ * Automation script: JMSMESSAGEADMIN   (language: groovy, no launch point)
  *
  * Call it in a browser while logged in to Maximo:
- *   https://<host>/maximo/api/script/JMSMSGADMIN
- *   (or /maximo/oslc/script/JMSMSGADMIN, on older 7.6.x)
+ *   https://<host>/maximo/api/script/JMSMESSAGEADMIN
+ *   (or /maximo/oslc/script/JMSMESSAGEADMIN, on older 7.6.x)
  *
  * Pages:
  *   no parameters          -> list of all queues from MaxQueueCache
@@ -304,7 +304,7 @@ Map deleteMessages(String queueName, List<String> ids) {
 			// if the method returns the number of deleted messages, use it; otherwise count the call as done
 			if (r instanceof Number && ((Number) r).intValue() <= 0) notFound.add(id) else deleted++
 		} catch (Throwable t) {
-			service.log_error("JMSMSGADMIN: deleteQueueData failed for " + queueName + ", " + sel + ": " + t)
+			service.log_error("JMSMESSAGEADMIN: deleteQueueData failed for " + queueName + ", " + sel + ": " + t)
 			failed.add(id + " (" + t + ")")
 		}
 	}
@@ -534,7 +534,7 @@ void renderQueueList(StringBuilder out, boolean countAll) {
 				counts.put(q, n)
 				totalMessages += n
 			} catch (Throwable t) {
-				service.log_error("JMSMSGADMIN: cannot count messages in " + q + ": " + t)
+				service.log_error("JMSMESSAGEADMIN: cannot count messages in " + q + ": " + t)
 				counts.put(q, t)
 			}
 		}
@@ -768,7 +768,7 @@ if (p1(params, "action", "").trim().toLowerCase() == "countqueue") {
 	try {
 		responseBody = groovy.json.JsonOutput.toJson([queue: q, count: browse(q, cf, null, -1, true).total])
 	} catch (Throwable t) {
-		service.log_error("JMSMSGADMIN: cannot count messages in " + q + ": " + t)
+		service.log_error("JMSMESSAGEADMIN: cannot count messages in " + q + ": " + t)
 		responseBody = groovy.json.JsonOutput.toJson([queue: q, error: t.toString()])
 	}
 	return
@@ -811,7 +811,7 @@ try {
 				banner.append('<div class="msg bad">No messages to delete.</div>')
 			} else {
 				Map d = deleteMessages(queueName, ids)
-				service.log_info("JMSMSGADMIN: user " + userInfo.getUserName() + " deleted " + d.deleted + " message(s) from " + queueName + ": " + ids)
+				service.log_info("JMSMESSAGEADMIN: user " + userInfo.getUserName() + " deleted " + d.deleted + " message(s) from " + queueName + ": " + ids)
 				boolean allOk = d.notFound.isEmpty() && d.failed.isEmpty()
 				banner.append('<div class="msg ').append(allOk ? "ok" : "bad").append('">Deleted ')
 				banner.append(d.deleted).append(' of ').append(ids.size()).append(' message(s).')
@@ -831,7 +831,7 @@ try {
 			try {
 				totalHtml = '<b>' + browse(queueName, confactName, null, -1, true).total + '</b>'
 			} catch (Throwable t) {
-				service.log_error("JMSMSGADMIN: cannot count messages in " + queueName + ": " + t)
+				service.log_error("JMSMESSAGEADMIN: cannot count messages in " + queueName + ": " + t)
 				totalHtml = '<span class="badge err">cannot count: ' + esc(t.toString()) + '</span>'
 			}
 		}
@@ -854,7 +854,7 @@ try {
 		}
 	}
 } catch (Throwable t) {
-	service.log_error("JMSMSGADMIN failed: " + t)
+	service.log_error("JMSMESSAGEADMIN failed: " + t)
 	StringWriter sw = new StringWriter()
 	t.printStackTrace(new PrintWriter(sw))
 	out.append('<div class="msg bad"><b>Error:</b> ').append(esc(t.toString())).append('</div>')
@@ -864,7 +864,7 @@ try {
 if (debug) {
 	debugInfo.add("action=[" + action + "], queueName=[" + queueName + "], confactName=[" + confactName + "], countOnly=" + countOnly + ", maxCount=" + maxCount)
 	out.append('<details open class="card"><summary><b>Debug</b></summary><pre>').append(esc(debugInfo.join("\n"))).append('</pre></details>')
-	service.log_info("JMSMSGADMIN debug:\n" + debugInfo.join("\n"))
+	service.log_info("JMSMESSAGEADMIN debug:\n" + debugInfo.join("\n"))
 }
 
 responseHeaders.put("content-type", "text/html")
