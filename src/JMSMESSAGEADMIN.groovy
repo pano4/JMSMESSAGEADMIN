@@ -11,7 +11,7 @@
  *   POST action=query      -> count or list messages (selector / maxcount)
  *   POST action=deleterow | deleteselected | deleteall -> delete by JMSMessageID, then re-query
  *
- * It talks to the queue with plain JMS (InitialContext + QueueBrowser / QueueReceiver),
+ * Messages are read with plain JMS (InitialContext + QueueBrowser) and deleted with MicServiceRemote.deleteQueueData(),
  * so it does not need JMSQueueBrowser or the private MicService.showMessages().
  * javax.jms / jakarta.jms classes are used dynamically, so it works with either.
  */
@@ -22,6 +22,7 @@ import java.util.zip.InflaterInputStream
 import javax.naming.InitialContext
 
 import psdi.iface.jms.MaxQueueCache
+import psdi.iface.mic.MicServiceRemote
 import psdi.server.MXServer
 
 // ---------------------------------------------------------------- settings
@@ -210,7 +211,7 @@ Map msgInfo(def m) {
 	names.sort().each { n -> props.put(n, m.getObjectProperty(n)) }
 	String body
 	try { body = readBody(m) } catch (Throwable t) { body = "[cannot read body: " + t + "]" }
-	return [id: m.getJMSMessageID(), props: props, body: body]
+	return [id: m.getJMSMessageID(), ts: ts, props: props, body: body]
 }
 
 // ---------------------------------------------------------------- JMS
@@ -287,26 +288,27 @@ Map browse(String queueName, String confactName, String selector, int max, boole
 	}
 }
 
-/** Removes messages by consuming them with a JMSMessageID selector. */
-Map deleteMessages(String queueName, String confactName, List<String> ids) {
+/**
+ * Deletes messages with Maximo's own MIC service, one call per message:
+ * deleteQueueData(queueName, "JMSMessageID = '<id>'", 1, null)
+ */
+Map deleteMessages(String queueName, List<String> ids) {
+	MicServiceRemote mic = (MicServiceRemote) MXServer.getMXServer().lookup("MIC")
 	int deleted = 0
 	List<String> notFound = []
-	Map j = null
-	try {
-		j = openJms(queueName, confactName)
-		for (String id : new LinkedHashSet<String>(ids)) {
-			def rcv = j.session.createReceiver(j.queue, "JMSMessageID = '" + id.replace("'", "''") + "'")
-			try {
-				def m = rcv.receive(3000L)
-				if (m != null) deleted++ else notFound.add(id)
-			} finally {
-				try { rcv.close() } catch (Throwable t) { }
-			}
+	List<String> failed = []
+	for (String id : new LinkedHashSet<String>(ids)) {
+		String sel = "JMSMessageID = '" + id.replace("'", "''") + "'"
+		try {
+			def r = mic.deleteQueueData(queueName, sel, 1, null)
+			// if the method returns the number of deleted messages, use it; otherwise count the call as done
+			if (r instanceof Number && ((Number) r).intValue() <= 0) notFound.add(id) else deleted++
+		} catch (Throwable t) {
+			service.log_error("JMSMSGADMIN: deleteQueueData failed for " + queueName + ", " + sel + ": " + t)
+			failed.add(id + " (" + t + ")")
 		}
-	} finally {
-		closeJms(j)
 	}
-	return [deleted: deleted, notFound: notFound]
+	return [deleted: deleted, notFound: notFound, failed: failed]
 }
 
 // ---------------------------------------------------------------- HTML
@@ -328,6 +330,7 @@ String cssCode() {
  .scroll{border:1px solid #dde3ea}
  .kv th{width:180px;position:static}
  a.flt{border-bottom:1px dashed #0f62fe} a.flt:hover{text-decoration:none;background:#e5efff}
+ button.mini{padding:0 6px;font-size:11px} .strong{font-weight:bold}
  .props{width:auto;min-width:50%} .props th{background:#f7f9fc}
  .muted{color:#6a7785} .nowrap{white-space:nowrap}
  .badge{display:inline-block;padding:1px 6px;border-radius:9px;font-size:11px;background:#e5ecf6}
@@ -347,6 +350,8 @@ String cssCode() {
  th.sortable[data-dir=desc]:after{content:' \\25BC';color:#1d2733}
  tr.filters th{background:#f7f9fc;font-weight:normal}
  tr.filters input,tr.filters select{width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px}
+ /* columns that only take the width of their content (checkbox, #, actions) */
+ th.shrink{width:1%} tr.filters input.num{width:3.5em}
 '''
 }
 
@@ -397,6 +402,73 @@ String jsCode() {
    function key(r){var x=r.cells[c];return x?(x.getAttribute('data-sort')||x.textContent).trim():'';}
    pairs.sort(function(a,z){return key(a[0]).localeCompare(key(z[0]),undefined,{numeric:true,sensitivity:'base'})*(asc?1:-1);});
    for(var k=0;k<pairs.length;k++){b.appendChild(pairs[k][0]);for(var q=0;q<pairs[k][1].length;q++){b.appendChild(pairs[k][1][q]);}}
+ }
+ /* ---- queue list: count the messages of one queue without reloading the page ---- */
+ function countQueue(btn){
+   var td=btn.closest('td'),span=td.querySelector('.cnt');
+   function showError(msg){
+     span.className='cnt';span.textContent='';
+     var b=document.createElement('span');b.className='badge err';b.title=msg;b.textContent='error';span.appendChild(b);
+     td.setAttribute('data-sort','-1');td.setAttribute('data-filter','error');
+   }
+   btn.disabled=true;span.className='cnt muted';span.textContent='...';
+   var u='?action=countqueue&queuename='+encodeURIComponent(btn.getAttribute('data-q'))+'&confactname='+encodeURIComponent(btn.getAttribute('data-cf'));
+   fetch(u,{credentials:'same-origin'})
+     .then(function(r){return r.json();})
+     .then(function(j){
+       if(j.error!==undefined&&j.error!==null){showError(j.error);return;}
+       var n=parseInt(j.count,10);
+       span.className='cnt'+(n>0?' strong':' muted');span.textContent=n;
+       td.setAttribute('data-sort',n);td.setAttribute('data-filter',n>0?'has messages':'empty');
+     })
+     .catch(function(e){showError(String(e));})
+     .then(function(){btn.disabled=false;applyFilters('qtable');});
+ }
+ /* ---- downloads (built in the browser from the message bodies already on the page) ---- */
+ function saveBlob(blob,name){
+   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+   document.body.appendChild(a);a.click();
+   setTimeout(function(){URL.revokeObjectURL(a.href);a.parentNode.removeChild(a);},1000);
+ }
+ function rowBody(tr){var b=document.getElementById(tr.getAttribute('data-body'));return b?b.textContent:'';}
+ function downloadRow(btn){
+   var tr=btn.closest('tr');
+   saveBlob(new Blob([rowBody(tr)],{type:'application/xml'}),tr.getAttribute('data-file'));
+ }
+ var CRC_T=null;
+ function crc32(u){
+   if(!CRC_T){CRC_T=new Uint32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++){c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);}CRC_T[n]=c>>>0;}}
+   var x=0xFFFFFFFF;for(var i=0;i<u.length;i++){x=CRC_T[(x^u[i])&255]^(x>>>8);}return (x^0xFFFFFFFF)>>>0;
+ }
+ /* minimal zip writer (no compression); files=[{name:'a.xml',data:Uint8Array}] */
+ function makeZip(files){
+   var enc=new TextEncoder(),parts=[],central=[],off=0;
+   function u16(v){return [v&255,(v>>>8)&255];}
+   function u32(v){return [v&255,(v>>>8)&255,(v>>>16)&255,(v>>>24)&255];}
+   for(var i=0;i<files.length;i++){
+     var f=files[i],nm=enc.encode(f.name),crc=crc32(f.data),sz=f.data.length;
+     var common=[].concat(u16(0x0800),u16(0),u16(0),u16(0x21),u32(crc),u32(sz),u32(sz),u16(nm.length),u16(0));
+     var lh=new Uint8Array([0x50,0x4b,3,4].concat(u16(20),common));
+     parts.push(lh,nm,f.data);
+     central.push(new Uint8Array([0x50,0x4b,1,2].concat(u16(20),u16(20),common,u16(0),u16(0),u16(0),u32(0),u32(off))),nm);
+     off+=lh.length+nm.length+sz;
+   }
+   var cs=0;for(var j=0;j<central.length;j++){cs+=central[j].length;}
+   var end=new Uint8Array([0x50,0x4b,5,6].concat(u16(0),u16(0),u16(files.length),u16(files.length),u32(cs),u32(off),u16(0)));
+   return new Blob(parts.concat(central,[end]),{type:'application/zip'});
+ }
+ function downloadDisplayed(btn){
+   var rows=dataRows(document.getElementById('mtable')),enc=new TextEncoder(),files=[],used={};
+   for(var i=0;i<rows.length;i++){
+     if(rows[i].style.display==='none')continue;
+     var name=rows[i].getAttribute('data-file'),base=name,n=1;
+     var stem=base.slice(-4).toLowerCase()==='.xml'?base.slice(0,-4):base;
+     while(used[name]){n++;name=stem+'_'+n+'.xml';}
+     used[name]=true;
+     files.push({name:name,data:enc.encode(rowBody(rows[i]))});
+   }
+   if(!files.length){alert('No messages displayed.');return;}
+   saveBlob(makeZip(files),btn.getAttribute('data-zip'));
  }
  /* ---- message table actions ---- */
  /* click on an INTERFACE / MSG_TRK_EXTSYS value: add "<prop> = '<value>'" to the Selector (AND) and run the query */
@@ -498,13 +570,17 @@ void renderQueueList(StringBuilder out, boolean countAll) {
 		def cnt = counts.get(q)
 		if (cnt instanceof Integer) {
 			int n = (Integer) cnt
-			out.append('<td data-sort="').append(n).append('" data-filter="').append(n > 0 ? "has messages" : "empty").append('">')
-			out.append(n > 0 ? '<b>' + n + '</b>' : '<span class="muted">0</span>').append('</td>')
+			out.append('<td class="nowrap" data-sort="').append(n).append('" data-filter="').append(n > 0 ? "has messages" : "empty").append('">')
+			out.append('<span class="cnt').append(n > 0 ? ' strong' : ' muted').append('">').append(n).append('</span>')
 		} else if (cnt instanceof Throwable) {
-			out.append('<td data-sort="-1" data-filter="error"><span class="badge err" title="').append(esc(cnt.toString())).append('">error</span></td>')
+			out.append('<td class="nowrap" data-sort="-1" data-filter="error">')
+			out.append('<span class="cnt"><span class="badge err" title="').append(esc(cnt.toString())).append('">error</span></span>')
 		} else {
-			out.append('<td data-sort="" data-filter=""></td>')
+			out.append('<td class="nowrap" data-sort="" data-filter=""><span class="cnt"></span>')
 		}
+		// per-queue count: JavaScript calls ?action=countqueue and updates only this cell
+		out.append(' <button type="button" class="mini" data-q="').append(esc(q)).append('" data-cf="').append(esc(r.get("confactName")))
+		out.append('" onclick="countQueue(this)">Count messages</button></td>')
 		out.append('<td><span class="badge ').append(inbound ? "in" : "out").append('">')
 		out.append(inbound ? "inbound" : "outbound").append('</span></td>')
 		out.append('<td>').append(seq ? "sequential" : "continuous").append('</td>')
@@ -543,13 +619,46 @@ void renderQueueHeader(StringBuilder out, String queueName, String confactName, 
 	out.append('</form></div>')
 }
 
+String safeFileName(String s) {
+	return (s == null ? "" : s).replaceAll("[^A-Za-z0-9._-]", "_")
+}
+
+/** Same naming as Maximo's "view queue data": SENDER_INTERFACE_MEAMessageID.xml (falls back to JMSMessageID). */
+String messageFileName(Map props, String jmsId) {
+	def sender = props.get("SENDER")
+	def iface = props.get("INTERFACE")
+	def meaId = props.get("MEAMessageID")
+	List<String> parts = []
+	if (sender) parts.add(sender.toString())
+	if (iface) parts.add(iface.toString())
+	parts.add(meaId ? meaId.toString() : jmsId)
+	return safeFileName(parts.join("_")) + ".xml"
+}
+
+/**
+ * Table cell whose value is a link: click -> Selector "<prop> = <value>" and run the query on the server.
+ * shown = displayed text, selValue = value used in the selector (numbers without quotes, strings quoted).
+ */
+void filterCell(StringBuilder out, String prop, def shown, def selValue, String cssClass) {
+	String cls = cssClass ? ' class="' + cssClass + '"' : ''
+	if (shown == null || shown.toString() == "" || selValue == null || selValue.toString() == "") {
+		out.append('<td').append(cls).append('>').append(esc(shown)).append('</td>')
+		return
+	}
+	String lit = (selValue instanceof Number) ? selValue.toString() : "'" + selValue.toString().replace("'", "''") + "'"
+	String cond = prop + " = " + lit
+	out.append('<td').append(cls).append(' data-sort="').append(esc(shown)).append('" data-filter="').append(esc(shown)).append('">')
+	out.append('<a href="#" class="flt" data-cond="').append(esc(cond)).append('" title="Query messages with ')
+	out.append(esc(cond)).append('" onclick="return filterLike(this)">').append(esc(shown)).append('</a></td>')
+}
+
 void renderResults(StringBuilder out, String queueName, String confactName, String selector, int maxCount, Map res) {
 	List<Map> msgs = (List<Map>) res.messages
 
 	// columns shown in the table; all other properties are only visible with "Show properties"
 	List<String> cols = ["MEAMessageID", "JMSTimestamp", "INTERFACE", "MSG_TRK_EXTSYS", "SENDER"]
 	// values in these columns are links that set the Selector and run the query
-	List<String> FILTER_LINK_COLS = ["INTERFACE", "MSG_TRK_EXTSYS"]
+	List<String> FILTER_LINK_COLS = ["MEAMessageID", "INTERFACE", "MSG_TRK_EXTSYS", "SENDER"]   // + JMSMessageID, JMSTimestamp
 	int colspan = 4 + cols.size()
 
 	out.append('<div class="card"><h2 style="margin-top:0">Messages</h2>')
@@ -568,6 +677,8 @@ void renderResults(StringBuilder out, String queueName, String confactName, Stri
 	// "allid" inputs for "Delete all displayed" are added by JavaScript from the rows that are currently visible
 
 	out.append('<div class="toolbar">')
+	out.append('<button type="button" data-zip="').append(esc(safeFileName(queueName.replace('/', '.')) + ".zip"))
+	out.append('" onclick="downloadDisplayed(this)">Download displayed messages (zip)</button>')
 	out.append('<button type="submit" class="danger" onclick="return doAct(\'deleteselected\',\'Delete the selected messages from the queue?\')">Delete selected messages</button>')
 	out.append('<button type="submit" class="danger" onclick="return doAct(\'deleteall\',\'\')">Delete all displayed messages</button>')
 	out.append('</div>')
@@ -578,12 +689,12 @@ void renderResults(StringBuilder out, String queueName, String confactName, Stri
 	out.append('</div>')
 
 	out.append('<div class="scroll"><table id="mtable" class="ft"><thead><tr>')
-	out.append('<th><input type="checkbox" title="Select all visible" onclick="setAll(this)"></th>')
-	out.append('<th class="sortable" onclick="sortTable(this)">#</th><th>Actions</th>')
+	out.append('<th class="shrink"><input type="checkbox" title="Select all visible" onclick="setAll(this)"></th>')
+	out.append('<th class="sortable shrink" onclick="sortTable(this)">#</th><th class="shrink">Actions</th>')
 	out.append('<th class="sortable" onclick="sortTable(this)">JMSMessageID</th>')
 	cols.each { c -> out.append('<th class="sortable" onclick="sortTable(this)">').append(esc(c)).append('</th>') }
 	out.append('</tr><tr class="filters"><th></th>')
-	out.append('<th><input type="text" data-col="1" placeholder="#" oninput="applyFilters(\'mtable\')"></th><th></th>')
+	out.append('<th><input type="text" class="num" data-col="1" placeholder="#" oninput="applyFilters(\'mtable\')"></th><th></th>')
 	int fc = 3
 	for (int k = 0; k <= cols.size(); k++) {
 		out.append('<th><input type="text" data-col="').append(fc + k).append('" placeholder="contains..." oninput="applyFilters(\'mtable\')"></th>')
@@ -595,23 +706,24 @@ void renderResults(StringBuilder out, String queueName, String confactName, Stri
 		i++
 		String rowId = "body" + i
 		String propId = "props" + i
-		out.append('<tr data-id="').append(esc(m.id)).append('"><td><input type="checkbox" name="msgid" value="').append(esc(m.id)).append('"></td>')
+		Map props = (Map) m.props
+		out.append('<tr data-id="').append(esc(m.id)).append('" data-body="').append(rowId)
+		out.append('" data-file="').append(esc(messageFileName(props, m.id.toString()))).append('"><td><input type="checkbox" name="msgid" value="').append(esc(m.id)).append('"></td>')
 		out.append('<td>').append(i).append('</td>')
 		out.append('<td class="nowrap">')
 		out.append('<button type="button" onclick="toggleRow(\'').append(rowId).append('\',this,\'message\')">Show message</button> ')
 		out.append('<button type="button" onclick="toggleRow(\'').append(propId).append('\',this,\'properties\')">Show properties</button> ')
+		out.append('<button type="button" onclick="downloadRow(this)">Download</button> ')
 		out.append('<button type="submit" class="danger" name="rowid" value="').append(esc(m.id))
 		out.append('" onclick="return doAct(\'deleterow\',\'Delete this message from the queue?\')">Delete</button></td>')
-		out.append('<td class="nowrap">').append(esc(m.id)).append('</td>')
-		Map props = (Map) m.props
+		filterCell(out, "JMSMessageID", m.id, m.id, "nowrap")
 		cols.each { c ->
 			def v = props.get(c)
-			if (v != null && v.toString() != "" && c in FILTER_LINK_COLS) {
-				// click on the value -> Selector "<c> = '<value>'" and run the query on the server
-				String cond = c + " = '" + v.toString().replace("'", "''") + "'"
-				out.append('<td data-sort="').append(esc(v)).append('" data-filter="').append(esc(v)).append('">')
-				out.append('<a href="#" class="flt" data-cond="').append(esc(cond)).append('" title="Query messages with ')
-				out.append(esc(cond)).append('" onclick="return filterLike(this)">').append(esc(v)).append('</a></td>')
+			if (c == "JMSTimestamp") {
+				// shown formatted, but the selector needs the long value in milliseconds
+				filterCell(out, c, v, m.ts, "nowrap")
+			} else if (c in FILTER_LINK_COLS) {
+				filterCell(out, c, v, v, null)
 			} else {
 				out.append('<td>').append(esc(v)).append('</td>')
 			}
@@ -644,6 +756,21 @@ if (resource == "css") {
 if (resource == "js") {
 	responseHeaders.put("content-type", "application/javascript")
 	responseBody = jsCode()
+	return
+}
+
+// count of one queue as JSON, used by the "Count messages" button in the queue list
+if (p1(params, "action", "").trim().toLowerCase() == "countqueue") {
+	String q = p1(params, "queuename", "").trim()
+	String cf = p1(params, "confactname", "").trim()
+	if ((cf.isEmpty() || cf == "null") && !q.isEmpty()) cf = parseCfg(MaxQueueCache.getInstance().getQueueConfig(q)).get("confactName")
+	responseHeaders.put("content-type", "application/json")
+	try {
+		responseBody = groovy.json.JsonOutput.toJson([queue: q, count: browse(q, cf, null, -1, true).total])
+	} catch (Throwable t) {
+		service.log_error("JMSMSGADMIN: cannot count messages in " + q + ": " + t)
+		responseBody = groovy.json.JsonOutput.toJson([queue: q, error: t.toString()])
+	}
 	return
 }
 boolean debug = "1".equals(p1(params, "debug", "")) || "true".equalsIgnoreCase(p1(params, "debug", ""))
@@ -683,12 +810,16 @@ try {
 			if (ids.isEmpty()) {
 				banner.append('<div class="msg bad">No messages to delete.</div>')
 			} else {
-				Map d = deleteMessages(queueName, confactName, ids)
+				Map d = deleteMessages(queueName, ids)
 				service.log_info("JMSMSGADMIN: user " + userInfo.getUserName() + " deleted " + d.deleted + " message(s) from " + queueName + ": " + ids)
-				banner.append('<div class="msg ').append(d.notFound.isEmpty() ? "ok" : "bad").append('">Deleted ')
+				boolean allOk = d.notFound.isEmpty() && d.failed.isEmpty()
+				banner.append('<div class="msg ').append(allOk ? "ok" : "bad").append('">Deleted ')
 				banner.append(d.deleted).append(' of ').append(ids.size()).append(' message(s).')
 				if (!d.notFound.isEmpty()) {
 					banner.append(' Not found (already processed or deleted): ').append(esc(d.notFound.join(", ")))
+				}
+				if (!d.failed.isEmpty()) {
+					banner.append('<br>Failed: ').append(esc(d.failed.join("; ")))
 				}
 				banner.append('</div>')
 			}
