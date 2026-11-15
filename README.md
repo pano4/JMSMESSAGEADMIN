@@ -1,8 +1,8 @@
-# JMSMSGADMIN
+# JMSMESSAGEADMIN
 
 Maximo script to browse and delete JMS queue messages.
 
-`JMSMSGADMIN` is a Groovy automation script for IBM Maximo / Maximo Manage. It serves a small web page that lists the integration (MIF) JMS queues configured in Maximo. From there you can count, inspect and delete the messages in each queue, for example to clean up `cqinerr` or check what is stuck in a sequential queue.
+`JMSMESSAGEADMIN` is a Groovy automation script for IBM Maximo / Maximo Manage. It serves a small web page that lists the integration (MIF) JMS queues configured in Maximo. From there you can count, inspect and delete the messages in each queue, for example to clean up `cqinerr` or check what is stuck in a sequential queue.
 
 ## Features
 
@@ -43,7 +43,7 @@ The JMS classes are called dynamically, so the script works with both `javax.jms
 
 1. In Maximo, open **Automation Scripts** and choose **Create → Script**.
 2. Create the script:
-   - **Script:** `JMSMSGADMIN`
+   - **Script:** `JMSMESSAGEADMIN`
    - **Language:** `groovy`
    - **Source:** the contents of `src/JMSMESSAGEADMIN.groovy`
 3. Save it and set the script to **Active**.
@@ -54,10 +54,10 @@ The JMS classes are called dynamically, so the script works with both `javax.jms
 While logged in to Maximo, open:
 
 ```
-https://<host>/maximo/api/script/JMSMSGADMIN
+https://<host>/maximo/api/script/JMSMESSAGEADMIN
 ```
 
-On older 7.6 systems, use `https://<host>/maximo/oslc/script/JMSMSGADMIN` instead.
+On older 7.6 systems, use `https://<host>/maximo/oslc/script/JMSMESSAGEADMIN` instead.
 
 | Parameter | Description |
 |---|---|
