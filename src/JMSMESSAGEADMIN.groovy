@@ -5,17 +5,24 @@
  *   https://<host>/maximo/api/script/JMSMESSAGEADMIN
  *   (or /maximo/oslc/script/JMSMESSAGEADMIN, on older 7.6.x)
  *
- * Pages:
- *   no parameters          -> list of all queues from MaxQueueCache
- *   ?queuename=<jndi name> -> queue info + query form
- *   POST action=query      -> count or list messages (selector / maxcount)
- *   POST action=deleterow | deleteselected | deleteall -> delete by JMSMessageID, then re-query
+ * Single page application. The page is loaded once; everything else is a data request:
+ *   (no resource)            -> minimal HTML page that loads the CSS and the JavaScript
+ *   resource=css             -> stylesheet
+ *   resource=js              -> JavaScript, builds the whole user interface
+ *   resource=json & op=...   -> JSON data requests made by the JavaScript:
+ *       op=queues                                              list of queues + user name
+ *       op=queue    & queuename                                configuration of one queue
+ *       op=count    & queuename & confactname [& selector]     number of messages
+ *       op=messages & queuename & confactname & selector & maxcount
+ *                                                              messages (headers, properties, body)
+ *       op=delete   & queuename & id=... & id=...   (POST)     delete messages by JMSMessageID
+ *   On failure a JSON request returns {"error": "..."}.
  *
- * Messages are read with plain JMS (InitialContext + QueueBrowser) and deleted with MicServiceRemote.deleteQueueData(),
- * so it does not need JMSQueueBrowser or the private MicService.showMessages().
- * javax.jms / jakarta.jms classes are used dynamically, so it works with either.
+ * Messages are read with plain JMS (InitialContext + QueueBrowser) and deleted with
+ * MicServiceRemote.deleteQueueData(). javax.jms / jakarta.jms classes are used dynamically.
  */
 
+import groovy.json.JsonOutput
 import java.text.SimpleDateFormat
 import java.util.zip.GZIPInputStream
 import java.util.zip.InflaterInputStream
@@ -25,9 +32,7 @@ import psdi.iface.jms.MaxQueueCache
 import psdi.iface.mic.MicServiceRemote
 import psdi.server.MXServer
 
-// ---------------------------------------------------------------- settings
 // Access is controlled by the script's own security in Maximo.
-String SCRIPT_TITLE = "JMS Message Admin"
 
 // ---------------------------------------------------------------- request parameters
 
@@ -52,38 +57,41 @@ void mergeParams(Map<String, List<String>> p, Map<String, List<String>> src) {
 	src.each { k, v -> if (!p.containsKey(k) && v != null && !v.isEmpty()) p.put(k, v) }
 }
 
+def httpRequest() {
+	try {
+		def req = binding.hasVariable("request") ? binding.getVariable("request") : null
+		return req?.getHttpServletRequest()
+	} catch (Throwable t) {
+		return null
+	}
+}
+
 /**
  * Reads the request parameters from every place Maximo may put them.
- * Important: once the servlet container (or a Maximo filter) has called getParameter(), the
- * form body of a POST is already consumed, so "requestBody" is empty. The servlet's
- * getParameterMap() still has the form fields, so it is read first.
+ * Once the servlet container has called getParameter(), the form body of a POST is consumed and
+ * "requestBody" is empty, but the servlet's getParameterMap() still has the form fields.
  */
-Map<String, List<String>> readParams(List<String> debug) {
+Map<String, List<String>> readParams() {
 	Map<String, List<String>> p = new LinkedHashMap<String, List<String>>()
-	def req = binding.hasVariable("request") ? binding.getVariable("request") : null
-	def http = null
-	try { http = req?.getHttpServletRequest() } catch (Throwable t) { debug.add("getHttpServletRequest: " + t) }
+	def http = httpRequest()
 
 	// 1) servlet parameters = query string + form body
 	if (http != null) {
 		try {
-			debug.add("method=" + http.getMethod() + ", contentType=" + http.getContentType() + ", queryString=" + http.getQueryString())
 			Map<String, List<String>> s = new LinkedHashMap<String, List<String>>()
 			http.getParameterMap().each { k, v ->
 				List<String> l = new ArrayList<String>()
 				if (v instanceof String[]) { for (String x : (String[]) v) l.add(x) } else if (v != null) l.add(v.toString())
 				s.put(k.toString(), l)
 			}
-			debug.add("servlet parameters: " + s)
 			mergeParams(p, s)
-		} catch (Throwable t) { debug.add("getParameterMap: " + t) }
+		} catch (Throwable t) { }
 	}
 
 	// 2) raw POST body (application/x-www-form-urlencoded), if Maximo passes it
 	if (binding.hasVariable("requestBody")) {
 		def rb = binding.getVariable("requestBody")
 		if (rb instanceof byte[]) rb = new String((byte[]) rb, "UTF-8")
-		debug.add("requestBody: " + rb)
 		Map<String, List<String>> b = new LinkedHashMap<String, List<String>>()
 		if (rb != null) parseQuery(rb.toString(), b)
 		mergeParams(p, b)
@@ -92,8 +100,9 @@ Map<String, List<String>> readParams(List<String> debug) {
 	// 3) query string
 	Map<String, List<String>> q = new LinkedHashMap<String, List<String>>()
 	try { parseQuery(http?.getQueryString(), q) } catch (Throwable t) { }
-	if (q.isEmpty() && req != null) {
-		for (String k : ["queuename", "confactname", "action", "selector", "maxcount", "countonly", "debug"]) {
+	if (q.isEmpty() && binding.hasVariable("request")) {
+		def req = binding.getVariable("request")
+		for (String k : ["resource", "op", "queuename", "confactname", "selector", "maxcount"]) {
 			try {
 				def v = req.getQueryParam(k)
 				if (v != null) q.put(k, [v.toString()])
@@ -101,7 +110,6 @@ Map<String, List<String>> readParams(List<String> debug) {
 		}
 	}
 	mergeParams(p, q)
-	debug.add("used parameters: " + p)
 	return p
 }
 
@@ -116,26 +124,6 @@ List<String> pAll(Map<String, List<String>> p, String k) {
 }
 
 // ---------------------------------------------------------------- helpers
-
-String esc(def o) {
-	if (o == null) return ""
-	String s = o.toString()
-	StringBuilder b = new StringBuilder(s.length() + 16)
-	for (int i = 0; i < s.length(); i++) {
-		char c = s.charAt(i)
-		switch (c) {
-			case '&': b.append("&amp;"); break
-			case '<': b.append("&lt;"); break
-			case '>': b.append("&gt;"); break
-			case '"': b.append("&quot;"); break
-			case '\'': b.append("&#39;"); break
-			default: b.append(c)
-		}
-	}
-	return b.toString()
-}
-
-String enc(String s) { return URLEncoder.encode(s == null ? "" : s, "UTF-8") }
 
 /** QueueConfig has no documented getters for everything, so read its toString(): queueName=..~confactName=..~... */
 Map<String, String> parseCfg(def cfg) {
@@ -196,6 +184,28 @@ String readBody(def m) {
 	return "[" + m.getClass().getName() + " - body type not supported]"
 }
 
+/** Keeps strings, numbers and booleans as they are (so the JavaScript knows the type), everything else as text. */
+def jsonValue(def v) {
+	if (v == null || v instanceof String || v instanceof Number || v instanceof Boolean) return v
+	return v.toString()
+}
+
+String safeFileName(String s) {
+	return (s == null ? "" : s).replaceAll("[^A-Za-z0-9._-]", "_")
+}
+
+/** Same naming as Maximo's "view queue data": SENDER_INTERFACE_MEAMessageID.xml (falls back to JMSMessageID). */
+String messageFileName(Map props, String jmsId) {
+	def sender = props.get("SENDER")
+	def iface = props.get("INTERFACE")
+	def meaId = props.get("MEAMessageID")
+	List<String> parts = []
+	if (sender) parts.add(sender.toString())
+	if (iface) parts.add(iface.toString())
+	parts.add(meaId ? meaId.toString() : jmsId)
+	return safeFileName(parts.join("_")) + ".xml"
+}
+
 Map msgInfo(def m) {
 	SimpleDateFormat df = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
 	Map<String, Object> props = new LinkedHashMap<String, Object>()
@@ -208,10 +218,11 @@ Map msgInfo(def m) {
 	List<String> names = []
 	def en = m.getPropertyNames()
 	while (en.hasMoreElements()) names.add(en.nextElement().toString())
-	names.sort().each { n -> props.put(n, m.getObjectProperty(n)) }
+	names.sort().each { n -> props.put(n, jsonValue(m.getObjectProperty(n))) }
 	String body
 	try { body = readBody(m) } catch (Throwable t) { body = "[cannot read body: " + t + "]" }
-	return [id: m.getJMSMessageID(), ts: ts, props: props, body: body]
+	String id = m.getJMSMessageID()
+	return [id: id, ts: ts, file: messageFileName(props, id), props: props, body: body]
 }
 
 // ---------------------------------------------------------------- JMS
@@ -246,7 +257,6 @@ Map openJms(String queueName, String cf) {
 		j.conn = conn
 		j.session = conn.createQueueSession(false, 1)   // non-transacted, AUTO_ACKNOWLEDGE
 		j.queue = queue
-		j.cf = cf
 		conn.start()
 		return j
 	} catch (Throwable t) {
@@ -311,39 +321,113 @@ Map deleteMessages(String queueName, List<String> ids) {
 	return [deleted: deleted, notFound: notFound, failed: failed]
 }
 
-// ---------------------------------------------------------------- HTML
+List<Map> queueList() {
+	def all = MaxQueueCache.getInstance().getQueueConfig()
+	def values = (all instanceof Map) ? ((Map) all).values() : all
+	List<Map> rows = []
+	values.each { cfg ->
+		Map<String, String> c = parseCfg(cfg)
+		String q = c.get("queueName")
+		if (!q) return
+		String mail = c.get("emailaddr")
+		rows.add([
+				queueName  : q,
+				confactName: c.get("confactName") == "null" ? "" : c.get("confactName"),
+				inbound    : "true".equals(c.get("inbound")),
+				sequential : "true".equals(c.get("sequential")),
+				errorQueue : q.toLowerCase().endsWith("err"),
+				emailaddr  : (mail == null || mail == "null") ? "" : mail
+		])
+	}
+	rows.sort { ((String) it.queueName).toLowerCase() }
+	return rows
+}
+
+// ---------------------------------------------------------------- JSON requests
+
+Map handleJson(Map<String, List<String>> params) {
+	String op = p1(params, "op", "").trim().toLowerCase()
+	String queueName = p1(params, "queuename", "").trim()
+	String cf = p1(params, "confactname", "").trim()
+	String selector = p1(params, "selector", "")
+
+	if (op == "queues") {
+		return [user: userInfo.getUserName(), queues: queueList()]
+	}
+
+	if (queueName.isEmpty()) throw new IllegalArgumentException("Parameter queuename is missing")
+	def cfg = MaxQueueCache.getInstance().getQueueConfig(queueName)
+	if (cfg == null) throw new IllegalArgumentException("Queue is not configured in Maximo: " + queueName)
+	if (cf.isEmpty() || cf == "null") cf = parseCfg(cfg).get("confactName") ?: ""
+
+	if (op == "queue") {
+		return [queue: queueName, config: parseCfg(cfg)]
+	}
+	if (op == "count") {
+		return [queue: queueName, count: browse(queueName, cf, selector, -1, true).total]
+	}
+	if (op == "messages") {
+		int max = 1
+		try { max = Integer.parseInt(p1(params, "maxcount", "1").trim()) } catch (Exception e) { max = 1 }
+		Map r = browse(queueName, cf, selector, max, false)
+		return [queue: queueName, more: r.more, messages: r.messages]
+	}
+	if (op == "delete") {
+		def http = httpRequest()
+		if (http != null && !"POST".equalsIgnoreCase(http.getMethod())) throw new IllegalStateException("Delete must be sent as POST")
+		List<String> ids = pAll(params, "id")
+		if (ids.isEmpty()) throw new IllegalArgumentException("No messages to delete")
+		Map d = deleteMessages(queueName, ids)
+		service.log_info("JMSMESSAGEADMIN: user " + userInfo.getUserName() + " deleted " + d.deleted + " message(s) from " + queueName + ": " + ids)
+		return d
+	}
+	throw new IllegalArgumentException("Unknown op: " + op)
+}
+
+// ---------------------------------------------------------------- page, CSS, JavaScript
+
+/** The only HTML page: everything else is built by the JavaScript. */
+String pageHtml() {
+	return '<!doctype html><html><head><meta charset="utf-8">' +
+			'<meta name="viewport" content="width=device-width, initial-scale=1">' +
+			'<title>JMS Message Admin</title>' +
+			'<link rel="stylesheet" href="?resource=css">' +
+			'<script src="?resource=js"></script>' +
+			'</head><body><noscript>This page needs JavaScript.</noscript></body></html>'
+}
 
 /** Served with ?resource=css */
 String cssCode() {
 	return '''
  body{font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:13px;margin:16px;color:#1d2733;background:#f5f7fa}
- h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:20px 0 8px}
+ h1{font-size:20px;margin:0 0 12px} h2{font-size:16px;margin:20px 0 8px} h2.first{margin-top:0}
  a{color:#0f62fe;text-decoration:none} a:hover{text-decoration:underline}
  /* inline-block + min-width:100%: a card fills the page width, but grows with a wide table
     (the page then scrolls horizontally instead of the table) */
  .card{display:inline-block;min-width:100%;box-sizing:border-box;background:#fff;border:1px solid #dde3ea;border-radius:6px;padding:12px 16px;margin-bottom:14px}
  table{border-collapse:collapse;width:100%;background:#fff}
  th,td{border:1px solid #dde3ea;padding:4px 8px;text-align:left;vertical-align:top}
- th{background:#eef2f7;position:sticky;top:0;white-space:nowrap}
+ th{background:#eef2f7;white-space:nowrap}
  tr:hover td{background:#f8fbff}
- /* no own scroll area: the table scrolls with the page, the header row stays at the top of the window */
  .scroll{border:1px solid #dde3ea}
- .kv th{width:180px;position:static}
- a.flt{border-bottom:1px dashed #0f62fe} a.flt:hover{text-decoration:none;background:#e5efff}
- button.mini{padding:0 6px;font-size:11px} .strong{font-weight:bold}
+ .kv th{width:180px}
  .props{width:auto;min-width:50%} .props th{background:#f7f9fc}
- .muted{color:#6a7785} .nowrap{white-space:nowrap}
+ .muted{color:#6a7785} .nowrap{white-space:nowrap} .strong{font-weight:bold} .big{font-size:16px}
  .badge{display:inline-block;padding:1px 6px;border-radius:9px;font-size:11px;background:#e5ecf6}
  .in{background:#dcf2e3} .out{background:#fde9d8} .err{background:#fbdada;color:#9b1c1c}
- .msg{padding:8px 12px;border-radius:4px;margin-bottom:12px}
+ .msg{padding:8px 12px;border-radius:4px;margin-bottom:12px;display:flex;gap:12px;align-items:flex-start}
+ .msg span{flex:1}
  .ok{background:#dcf2e3} .bad{background:#fbdada}
  label{margin-right:16px} input[type=text]{width:420px;max-width:100%} input[type=number]{width:90px}
  button{cursor:pointer;padding:3px 10px;border:1px solid #8a99a8;border-radius:4px;background:#fff}
+ button:disabled{cursor:default;opacity:.6}
  button.primary{background:#0f62fe;color:#fff;border-color:#0f62fe}
  button.danger{color:#b00020;border-color:#b00020}
+ button.mini{padding:0 6px;font-size:11px}
  pre{white-space:pre-wrap;word-break:break-all;margin:0;max-height:500px;overflow:auto;background:#fbfcfe;padding:8px;border:1px solid #e3e8ee}
  .toolbar{margin:8px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
- table.ft thead{position:sticky;top:0;z-index:1} table.ft th{position:static}
+ /* no own scroll area: the table scrolls with the page, the header rows stay at the top of the window */
+ table.ft thead{position:sticky;top:0;z-index:1}
  th.sortable{cursor:pointer;user-select:none}
  th.sortable:after{content:' \\2195';color:#9aa6b2}
  th.sortable[data-dir=asc]:after{content:' \\25B2';color:#1d2733}
@@ -352,520 +436,454 @@ String cssCode() {
  tr.filters input,tr.filters select{width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px}
  /* columns that only take the width of their content (checkbox, #, actions) */
  th.shrink{width:1%} tr.filters input.num{width:3.5em}
+ a.flt{border-bottom:1px dashed #0f62fe} a.flt:hover{text-decoration:none;background:#e5efff}
 '''
-}
-
-/** Served with ?resource=js */
-String jsCode() {
-	return '''
- function toggleRow(id,btn,label){var r=document.getElementById(id);r.hidden=!r.hidden;btn.textContent=(r.hidden?'Show ':'Hide ')+label;}
- /* ---- client-side filter + sort for tables with class "ft" (no server requests) ----
-    Rows with class "detail" (properties, message body) belong to the data row above them. */
- function dataRows(t){var r=t.tBodies[0].rows,a=[];for(var i=0;i<r.length;i++){if(!r[i].classList.contains('detail'))a.push(r[i]);}return a;}
- function detailsOf(r){var a=[],n=r.nextElementSibling;while(n&&n.classList.contains('detail')){a.push(n);n=n.nextElementSibling;}return a;}
- function applyFilters(tid){
-   var t=document.getElementById(tid);if(!t)return;
-   var gi=document.getElementById(tid+'-global'),g=gi?gi.value.trim().toLowerCase():'';
-   var f=t.querySelectorAll('thead tr.filters input[data-col], thead tr.filters select[data-col]');
-   var rows=dataRows(t),shown=0;
-   for(var i=0;i<rows.length;i++){
-     var r=rows[i],d=detailsOf(r),all=r.textContent;
-     for(var x=0;x<d.length;x++){all+=' '+d[x].textContent;}
-     var ok=!g||all.toLowerCase().indexOf(g)>=0;
-     for(var j=0;ok&&j<f.length;j++){
-       var v=f[j].value.trim().toLowerCase();if(!v)continue;
-       var cell=r.cells[parseInt(f[j].getAttribute('data-col'),10)];
-       var txt=(cell.getAttribute('data-filter')||cell.textContent).trim().toLowerCase();
-       ok=f[j].tagName==='SELECT'?txt===v:txt.indexOf(v)>=0;
-     }
-     r.style.display=ok?'':'none';for(var y=0;y<d.length;y++){d[y].style.display=ok?'':'none';}
-     if(!ok){var cb=r.querySelector('input[name=msgid]');if(cb)cb.checked=false;}
-     if(ok)shown++;
-   }
-   var c=document.getElementById(tid+'-count');
-   if(c)c.textContent=shown+' of '+rows.length+' '+(c.getAttribute('data-noun')||'rows');
- }
- function clearFilters(tid){
-   var gi=document.getElementById(tid+'-global');if(gi)gi.value='';
-   var f=document.querySelectorAll('#'+tid+' thead tr.filters input[data-col], #'+tid+' thead tr.filters select[data-col]');
-   for(var i=0;i<f.length;i++){f[i].value='';}
-   applyFilters(tid);
- }
- function sortTable(th){
-   var t=th.closest('table'),c=th.cellIndex,b=t.tBodies[0];
-   var asc=th.getAttribute('data-dir')!=='asc';
-   var hs=t.querySelectorAll('thead th.sortable');
-   for(var i=0;i<hs.length;i++){hs[i].removeAttribute('data-dir');}
-   th.setAttribute('data-dir',asc?'asc':'desc');
-   var rows=dataRows(t),pairs=[];
-   for(var p=0;p<rows.length;p++){pairs.push([rows[p],detailsOf(rows[p])]);}
-   function key(r){var x=r.cells[c];return x?(x.getAttribute('data-sort')||x.textContent).trim():'';}
-   pairs.sort(function(a,z){return key(a[0]).localeCompare(key(z[0]),undefined,{numeric:true,sensitivity:'base'})*(asc?1:-1);});
-   for(var k=0;k<pairs.length;k++){b.appendChild(pairs[k][0]);for(var q=0;q<pairs[k][1].length;q++){b.appendChild(pairs[k][1][q]);}}
- }
- /* ---- queue list: count the messages of one queue without reloading the page ---- */
- function countQueue(btn){
-   var td=btn.closest('td'),span=td.querySelector('.cnt');
-   function showError(msg){
-     span.className='cnt';span.textContent='';
-     var b=document.createElement('span');b.className='badge err';b.title=msg;b.textContent='error';span.appendChild(b);
-     td.setAttribute('data-sort','-1');td.setAttribute('data-filter','error');
-   }
-   btn.disabled=true;span.className='cnt muted';span.textContent='...';
-   var u='?action=countqueue&queuename='+encodeURIComponent(btn.getAttribute('data-q'))+'&confactname='+encodeURIComponent(btn.getAttribute('data-cf'));
-   fetch(u,{credentials:'same-origin'})
-     .then(function(r){return r.json();})
-     .then(function(j){
-       if(j.error!==undefined&&j.error!==null){showError(j.error);return;}
-       var n=parseInt(j.count,10);
-       span.className='cnt'+(n>0?' strong':' muted');span.textContent=n;
-       td.setAttribute('data-sort',n);td.setAttribute('data-filter',n>0?'has messages':'empty');
-     })
-     .catch(function(e){showError(String(e));})
-     .then(function(){btn.disabled=false;applyFilters('qtable');});
- }
- /* ---- downloads (built in the browser from the message bodies already on the page) ---- */
- function saveBlob(blob,name){
-   var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
-   document.body.appendChild(a);a.click();
-   setTimeout(function(){URL.revokeObjectURL(a.href);a.parentNode.removeChild(a);},1000);
- }
- function rowBody(tr){var b=document.getElementById(tr.getAttribute('data-body'));return b?b.textContent:'';}
- function downloadRow(btn){
-   var tr=btn.closest('tr');
-   saveBlob(new Blob([rowBody(tr)],{type:'application/xml'}),tr.getAttribute('data-file'));
- }
- var CRC_T=null;
- function crc32(u){
-   if(!CRC_T){CRC_T=new Uint32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++){c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);}CRC_T[n]=c>>>0;}}
-   var x=0xFFFFFFFF;for(var i=0;i<u.length;i++){x=CRC_T[(x^u[i])&255]^(x>>>8);}return (x^0xFFFFFFFF)>>>0;
- }
- /* minimal zip writer (no compression); files=[{name:'a.xml',data:Uint8Array}] */
- function makeZip(files){
-   var enc=new TextEncoder(),parts=[],central=[],off=0;
-   function u16(v){return [v&255,(v>>>8)&255];}
-   function u32(v){return [v&255,(v>>>8)&255,(v>>>16)&255,(v>>>24)&255];}
-   for(var i=0;i<files.length;i++){
-     var f=files[i],nm=enc.encode(f.name),crc=crc32(f.data),sz=f.data.length;
-     var common=[].concat(u16(0x0800),u16(0),u16(0),u16(0x21),u32(crc),u32(sz),u32(sz),u16(nm.length),u16(0));
-     var lh=new Uint8Array([0x50,0x4b,3,4].concat(u16(20),common));
-     parts.push(lh,nm,f.data);
-     central.push(new Uint8Array([0x50,0x4b,1,2].concat(u16(20),u16(20),common,u16(0),u16(0),u16(0),u32(0),u32(off))),nm);
-     off+=lh.length+nm.length+sz;
-   }
-   var cs=0;for(var j=0;j<central.length;j++){cs+=central[j].length;}
-   var end=new Uint8Array([0x50,0x4b,5,6].concat(u16(0),u16(0),u16(files.length),u16(files.length),u32(cs),u32(off),u16(0)));
-   return new Blob(parts.concat(central,[end]),{type:'application/zip'});
- }
- function downloadDisplayed(btn){
-   var rows=dataRows(document.getElementById('mtable')),enc=new TextEncoder(),files=[],used={};
-   for(var i=0;i<rows.length;i++){
-     if(rows[i].style.display==='none')continue;
-     var name=rows[i].getAttribute('data-file'),base=name,n=1;
-     var stem=base.slice(-4).toLowerCase()==='.xml'?base.slice(0,-4):base;
-     while(used[name]){n++;name=stem+'_'+n+'.xml';}
-     used[name]=true;
-     files.push({name:name,data:enc.encode(rowBody(rows[i]))});
-   }
-   if(!files.length){alert('No messages displayed.');return;}
-   saveBlob(makeZip(files),btn.getAttribute('data-zip'));
- }
- /* ---- message table actions ---- */
- /* click on an INTERFACE / MSG_TRK_EXTSYS value: add "<prop> = '<value>'" to the Selector (AND) and run the query */
- function filterLike(a){
-   var cond=a.getAttribute('data-cond'),sel=document.getElementById('q-selector'),cur=sel.value.trim();
-   if(cur.indexOf(cond)<0){sel.value=cur?'('+cur+') AND '+cond:cond;}
-   var co=document.getElementById('q-countonly');if(co)co.checked=false;
-   document.getElementById('qform').submit();
-   return false;
- }
- function setAll(cb){
-   var rows=dataRows(cb.closest('table'));
-   for(var i=0;i<rows.length;i++){var c=rows[i].querySelector('input[name=msgid]');if(c)c.checked=cb.checked&&rows[i].style.display!=='none';}
- }
- function doAct(a,txt){
-   var t=document.getElementById('mtable');
-   if(a==='deleteselected'&&!t.querySelector('input[name=msgid]:checked')){alert('No messages selected.');return false;}
-   if(a==='deleteall'){
-     var form=t.closest('form'),old=form.querySelectorAll('input[name=allid]');
-     for(var i=0;i<old.length;i++){old[i].parentNode.removeChild(old[i]);}
-     var rows=dataRows(t),n=0;
-     for(var j=0;j<rows.length;j++){
-       if(rows[j].style.display==='none')continue;
-       var inp=document.createElement('input');inp.type='hidden';inp.name='allid';inp.value=rows[j].getAttribute('data-id');
-       form.appendChild(inp);n++;
-     }
-     if(!n){alert('No messages displayed.');return false;}
-     txt='Delete all '+n+' displayed messages from the queue?';
-   }
-   if(!confirm(txt))return false;
-   document.getElementById('act').value=a;return true;
- }
-'''
-}
-
-/** CSS and JavaScript are loaded from this same script with a second request (?resource=css / ?resource=js). */
-String pageStart(String title) {
-	return '<!doctype html><html><head><meta charset="utf-8">\n' +
-			'<meta name="viewport" content="width=device-width, initial-scale=1">\n' +
-			'<title>' + esc(title) + '</title>\n' +
-			'<link rel="stylesheet" href="?resource=css">\n' +
-			'<script src="?resource=js"></script>\n' +
-			'</head><body>\n'
-}
-
-String pageEnd() { return "</body></html>" }
-
-/** countAll: count the messages of every queue (no selector) and show them in the "Messages" column. */
-void renderQueueList(StringBuilder out, boolean countAll) {
-	def all = MaxQueueCache.getInstance().getQueueConfig()
-	def values = (all instanceof Map) ? ((Map) all).values() : all
-	List<Map<String, String>> rows = []
-	values.each { cfg -> Map<String, String> m = parseCfg(cfg); if (m.get("queueName")) rows.add(m) }
-	rows.sort { it.get("queueName").toLowerCase() }
-
-	Map<String, Object> counts = new HashMap<String, Object>()   // queue -> Integer or Throwable
-	long totalMessages = 0
-	if (countAll) {
-		for (Map<String, String> r : rows) {
-			String q = r.get("queueName")
-			try {
-				int n = (int) browse(q, r.get("confactName"), null, -1, true).total
-				counts.put(q, n)
-				totalMessages += n
-			} catch (Throwable t) {
-				service.log_error("JMSMESSAGEADMIN: cannot count messages in " + q + ": " + t)
-				counts.put(q, t)
-			}
-		}
-	}
-
-	out.append('<div class="card"><div class="toolbar"><b id="qtable-count" data-noun="queues">').append(rows.size()).append(' of ').append(rows.size()).append(' queues</b>')
-	out.append('<input type="text" id="qtable-global" placeholder="Search all columns..." oninput="applyFilters(\'qtable\')" style="width:260px">')
-	out.append('<button type="button" onclick="clearFilters(\'qtable\')">Clear filters</button>')
-	out.append('<form method="post" action="" style="display:inline"><input type="hidden" name="action" value="countall">')
-	out.append('<button type="submit" class="primary">Count messages in all queues</button></form>')
-	if (countAll) out.append('<span class="muted">').append(totalMessages).append(' messages in all queues</span>')
-	out.append('</div>')
-	out.append('<div class="scroll"><table id="qtable" class="ft"><thead><tr>')
-	for (String h : ["Queue", "Messages", "Direction", "Type", "Error queue", "Connection factory", "Email"]) {
-		out.append('<th class="sortable" onclick="sortTable(this)">').append(h).append('</th>')
-	}
-	out.append('</tr><tr class="filters">')
-	out.append('<th><input type="text" data-col="0" placeholder="contains..." oninput="applyFilters(\'qtable\')"></th>')
-	out.append('<th><select data-col="1" onchange="applyFilters(\'qtable\')"><option value="">all</option><option value="has messages">has messages</option><option value="empty">empty</option><option value="error">error</option></select></th>')
-	out.append('<th><select data-col="2" onchange="applyFilters(\'qtable\')"><option value="">all</option><option>inbound</option><option>outbound</option></select></th>')
-	out.append('<th><select data-col="3" onchange="applyFilters(\'qtable\')"><option value="">all</option><option>sequential</option><option>continuous</option></select></th>')
-	out.append('<th><select data-col="4" onchange="applyFilters(\'qtable\')"><option value="">all</option><option>yes</option><option>no</option></select></th>')
-	out.append('<th><input type="text" data-col="5" placeholder="contains..." oninput="applyFilters(\'qtable\')"></th>')
-	out.append('<th><input type="text" data-col="6" placeholder="contains..." oninput="applyFilters(\'qtable\')"></th>')
-	out.append('</tr></thead><tbody>')
-	for (Map<String, String> r : rows) {
-		String q = r.get("queueName")
-		boolean inbound = "true".equals(r.get("inbound"))
-		boolean seq = "true".equals(r.get("sequential"))
-		boolean err = q.toLowerCase().endsWith("err")
-		out.append('<tr><td><a href="?queuename=').append(esc(enc(q)))
-		out.append('&amp;confactname=').append(esc(enc(r.get("confactName")))).append('">').append(esc(q)).append('</a></td>')
-		def cnt = counts.get(q)
-		if (cnt instanceof Integer) {
-			int n = (Integer) cnt
-			out.append('<td class="nowrap" data-sort="').append(n).append('" data-filter="').append(n > 0 ? "has messages" : "empty").append('">')
-			out.append('<span class="cnt').append(n > 0 ? ' strong' : ' muted').append('">').append(n).append('</span>')
-		} else if (cnt instanceof Throwable) {
-			out.append('<td class="nowrap" data-sort="-1" data-filter="error">')
-			out.append('<span class="cnt"><span class="badge err" title="').append(esc(cnt.toString())).append('">error</span></span>')
-		} else {
-			out.append('<td class="nowrap" data-sort="" data-filter=""><span class="cnt"></span>')
-		}
-		// per-queue count: JavaScript calls ?action=countqueue and updates only this cell
-		out.append(' <button type="button" class="mini" data-q="').append(esc(q)).append('" data-cf="').append(esc(r.get("confactName")))
-		out.append('" onclick="countQueue(this)">Count messages</button></td>')
-		out.append('<td><span class="badge ').append(inbound ? "in" : "out").append('">')
-		out.append(inbound ? "inbound" : "outbound").append('</span></td>')
-		out.append('<td>').append(seq ? "sequential" : "continuous").append('</td>')
-		out.append('<td>').append(err ? '<span class="badge err">yes</span>' : "no").append('</td>')
-		out.append('<td>').append(esc(r.get("confactName"))).append('</td>')
-		String mail = r.get("emailaddr")
-		out.append('<td>').append("null".equals(mail) ? "" : esc(mail)).append('</td></tr>')
-	}
-	out.append('</tbody></table></div></div>')
-}
-
-void renderQueueHeader(StringBuilder out, String queueName, String confactName, String selector, int maxCount, boolean countOnly, String totalHtml) {
-	def cfg = MaxQueueCache.getInstance().getQueueConfig(queueName)
-	out.append('<p><a href="?">&larr; All queues</a></p>')
-	if (cfg == null) {
-		out.append('<div class="msg bad">Queue <b>').append(esc(queueName)).append('</b> is not configured in Maximo.</div>')
-		return
-	}
-	Map<String, String> c = parseCfg(cfg)
-	out.append('<div class="card"><h2 style="margin-top:0">').append(esc(queueName)).append('</h2><table class="kv">')
-	out.append('<tr><th>Messages in queue</th><td style="font-size:16px">').append(totalHtml ?: "").append('</td></tr>')
-	c.each { k, v -> out.append('<tr><th>').append(esc(k)).append('</th><td>').append(esc(v)).append('</td></tr>') }
-	out.append('</table></div>')
-
-	out.append('<div class="card"><form id="qform" method="post" action="">')
-	out.append('<input type="hidden" name="queuename" value="').append(esc(queueName)).append('">')
-	out.append('<input type="hidden" name="confactname" value="').append(esc(confactName)).append('">')
-	out.append('<input type="hidden" name="action" value="query">')
-	out.append('<div class="toolbar">')
-	out.append('<label><input type="checkbox" id="q-countonly" name="countonly" value="true"').append(countOnly ? " checked" : "").append('> Count only</label>')
-	out.append('<label>Selector <input type="text" id="q-selector" name="selector" value="').append(esc(selector))
-	out.append('" placeholder="e.g. INTERFACE = \'MXASSETInterface\'"></label>')
-	out.append('<label>Max count <input type="number" name="maxcount" min="-1" value="').append(maxCount).append('"></label>')
-	out.append('<button type="submit" class="primary">Query</button>')
-	out.append('</div><div class="muted">Max count -1 = all messages.</div>')
-	out.append('</form></div>')
-}
-
-String safeFileName(String s) {
-	return (s == null ? "" : s).replaceAll("[^A-Za-z0-9._-]", "_")
-}
-
-/** Same naming as Maximo's "view queue data": SENDER_INTERFACE_MEAMessageID.xml (falls back to JMSMessageID). */
-String messageFileName(Map props, String jmsId) {
-	def sender = props.get("SENDER")
-	def iface = props.get("INTERFACE")
-	def meaId = props.get("MEAMessageID")
-	List<String> parts = []
-	if (sender) parts.add(sender.toString())
-	if (iface) parts.add(iface.toString())
-	parts.add(meaId ? meaId.toString() : jmsId)
-	return safeFileName(parts.join("_")) + ".xml"
 }
 
 /**
- * Table cell whose value is a link: click -> Selector "<prop> = <value>" and run the query on the server.
- * shown = displayed text, selValue = value used in the selector (numbers without quotes, strings quoted).
+ * Served with ?resource=js
+ * Note: this is a Groovy string, so the JavaScript must not contain backslashes.
  */
-void filterCell(StringBuilder out, String prop, def shown, def selValue, String cssClass) {
-	String cls = cssClass ? ' class="' + cssClass + '"' : ''
-	if (shown == null || shown.toString() == "" || selValue == null || selValue.toString() == "") {
-		out.append('<td').append(cls).append('>').append(esc(shown)).append('</td>')
-		return
-	}
-	String lit = (selValue instanceof Number) ? selValue.toString() : "'" + selValue.toString().replace("'", "''") + "'"
-	String cond = prop + " = " + lit
-	out.append('<td').append(cls).append(' data-sort="').append(esc(shown)).append('" data-filter="').append(esc(shown)).append('">')
-	out.append('<a href="#" class="flt" data-cond="').append(esc(cond)).append('" title="Query messages with ')
-	out.append(esc(cond)).append('" onclick="return filterLike(this)">').append(esc(shown)).append('</a></td>')
+String jsCode() {
+	return '''
+var App={user:'',queues:[],counts:{},queue:null,cf:'',selector:'',maxcount:1,countonly:false,messages:[]};
+var BASE=location.pathname;
+var COLS=['MEAMessageID','JMSTimestamp','INTERFACE','MSG_TRK_EXTSYS','SENDER'];
+var LINK_COLS=['MEAMessageID','INTERFACE','MSG_TRK_EXTSYS','SENDER'];
+
+/* ================= helpers ================= */
+function el(id){return document.getElementById(id);}
+function esc(s){
+  if(s===null||s===undefined)return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+/* JSON request to this script: resource=json&op=... ; post=true sends the parameters as a form POST */
+function api(op,params,post){
+  var p=new URLSearchParams();
+  Object.keys(params||{}).forEach(function(k){
+    var v=params[k];
+    if(Array.isArray(v)){v.forEach(function(x){p.append(k,x);});}
+    else if(v!==undefined&&v!==null){p.append(k,v);}
+  });
+  var url=BASE+'?resource=json&op='+encodeURIComponent(op);
+  var opt={credentials:'same-origin',headers:{'Accept':'application/json'}};
+  if(post){opt.method='POST';opt.body=p;}else{var qs=p.toString();if(qs)url+='&'+qs;}
+  return fetch(url,opt).then(function(r){
+    return r.text().then(function(t){
+      var j;
+      try{j=JSON.parse(t);}catch(e){throw new Error('HTTP '+r.status+': unexpected response from the server (Maximo session expired?)');}
+      if(j&&j.error)throw new Error(j.error);
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      return j;
+    });
+  });
+}
+function notify(text,ok){
+  var b=el('banner');if(!b)return;
+  if(!text){b.innerHTML='';return;}
+  b.innerHTML='<div class="msg '+(ok?'ok':'bad')+'"><span>'+esc(text)+'</span><button type="button" class="mini" onclick="notify()">close</button></div>';
+}
+function fail(e){notify(e&&e.message?e.message:String(e),false);}
+
+/* ================= navigation (hash, so the page is never reloaded) ================= */
+function queueHash(q,cf){return '#queue='+encodeURIComponent(q)+'&cf='+encodeURIComponent(cf||'');}
+function route(){
+  var p=new URLSearchParams(location.hash.slice(1));
+  var q=p.get('queue');
+  notify();
+  if(q){showQueue(q,p.get('cf')||'');}else{showList();}
+}
+function init(){
+  document.body.innerHTML='<h1>JMS Message Admin <span id="user" class="muted" style="font-size:12px;font-weight:normal"></span></h1>'+
+    '<div id="banner"></div><div id="view"><div class="card muted">Loading...</div></div>';
+  window.addEventListener('hashchange',route);
+  api('queues').then(function(j){
+    App.user=j.user;App.queues=j.queues||[];
+    el('user').textContent='user: '+App.user;
+    route();
+  }).catch(function(e){el('view').innerHTML='';fail(e);});
+}
+document.addEventListener('DOMContentLoaded',init);
+
+/* ================= client-side filter + sort (tables inside an element with data-table) =================
+   Rows with class "detail" (properties, message body) belong to the data row above them. */
+function tid(x){return typeof x==='string'?x:x.closest('[data-table]').getAttribute('data-table');}
+function dataRows(t){var r=t.tBodies[0].rows,a=[];for(var i=0;i<r.length;i++){if(!r[i].classList.contains('detail'))a.push(r[i]);}return a;}
+function detailsOf(r){var a=[],n=r.nextElementSibling;while(n&&n.classList.contains('detail')){a.push(n);n=n.nextElementSibling;}return a;}
+function applyFilters(x){
+  var id=tid(x),t=el(id);if(!t)return;
+  var gi=el(id+'-global'),g=gi?gi.value.trim().toLowerCase():'';
+  var f=t.querySelectorAll('thead tr.filters input[data-col], thead tr.filters select[data-col]');
+  var rows=dataRows(t),shown=0;
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i],d=detailsOf(r),all=r.textContent;
+    for(var a=0;a<d.length;a++){all+=' '+d[a].textContent;}
+    var ok=!g||all.toLowerCase().indexOf(g)>=0;
+    for(var j=0;ok&&j<f.length;j++){
+      var v=f[j].value.trim().toLowerCase();if(!v)continue;
+      var cell=r.cells[parseInt(f[j].getAttribute('data-col'),10)];
+      var txt=(cell.getAttribute('data-filter')||cell.textContent).trim().toLowerCase();
+      ok=f[j].tagName==='SELECT'?txt===v:txt.indexOf(v)>=0;
+    }
+    r.style.display=ok?'':'none';
+    for(var y=0;y<d.length;y++){d[y].style.display=ok?'':'none';}
+    if(!ok){var cb=r.querySelector('input[name=msgid]');if(cb)cb.checked=false;}
+    if(ok)shown++;
+  }
+  var c=el(id+'-count');
+  if(c)c.textContent=shown+' of '+rows.length+' '+(c.getAttribute('data-noun')||'rows');
+}
+function clearFilters(x){
+  var id=tid(x),gi=el(id+'-global');if(gi)gi.value='';
+  var f=el(id).querySelectorAll('thead tr.filters input[data-col], thead tr.filters select[data-col]');
+  for(var i=0;i<f.length;i++){f[i].value='';}
+  applyFilters(id);
+}
+function sortTable(th){
+  var t=th.closest('table'),c=th.cellIndex,b=t.tBodies[0];
+  var asc=th.getAttribute('data-dir')!=='asc';
+  var hs=t.querySelectorAll('thead th.sortable');
+  for(var i=0;i<hs.length;i++){hs[i].removeAttribute('data-dir');}
+  th.setAttribute('data-dir',asc?'asc':'desc');
+  var rows=dataRows(t),pairs=[];
+  for(var p=0;p<rows.length;p++){pairs.push([rows[p],detailsOf(rows[p])]);}
+  function key(r){var x=r.cells[c];return x?(x.getAttribute('data-sort')||x.textContent).trim():'';}
+  pairs.sort(function(a,z){return key(a[0]).localeCompare(key(z[0]),undefined,{numeric:true,sensitivity:'base'})*(asc?1:-1);});
+  for(var k=0;k<pairs.length;k++){b.appendChild(pairs[k][0]);for(var q=0;q<pairs[k][1].length;q++){b.appendChild(pairs[k][1][q]);}}
+}
+function searchBox(id,placeholder,width){
+  return '<input type="text" id="'+id+'-global" placeholder="'+placeholder+'" oninput="applyFilters(this)" style="width:'+width+'px">'+
+    '<button type="button" onclick="clearFilters(this)">Clear filters</button>';
+}
+function textFilter(col,cls,ph){
+  return '<th><input type="text"'+(cls?' class="'+cls+'"':'')+' data-col="'+col+'" placeholder="'+(ph||'contains...')+'" oninput="applyFilters(this)"></th>';
+}
+function selectFilter(col,options){
+  var h='<th><select data-col="'+col+'" onchange="applyFilters(this)"><option value="">all</option>';
+  options.forEach(function(o){h+='<option value="'+esc(o)+'">'+esc(o)+'</option>';});
+  return h+'</select></th>';
+}
+function sortTh(label,cls){return '<th class="sortable'+(cls?' '+cls:'')+'" onclick="sortTable(this)">'+esc(label)+'</th>';}
+
+/* ================= queue list ================= */
+function showList(){
+  App.queue=null;
+  var qs=App.queues,h=[];
+  h.push('<div class="card" data-table="qtable"><div class="toolbar">');
+  h.push('<b id="qtable-count" data-noun="queues">'+qs.length+' of '+qs.length+' queues</b>');
+  h.push(searchBox('qtable','Search all columns...',260));
+  h.push('<button type="button" class="primary" onclick="countAll(this)">Count messages in all queues</button>');
+  h.push('<span id="countall-info" class="muted"></span></div>');
+  h.push('<div class="scroll"><table id="qtable" class="ft"><thead><tr>');
+  ['Queue','Messages','Direction','Type','Error queue','Connection factory','Email'].forEach(function(x){h.push(sortTh(x));});
+  h.push('</tr><tr class="filters">');
+  h.push(textFilter(0));
+  h.push(selectFilter(1,['has messages','empty','error']));
+  h.push(selectFilter(2,['inbound','outbound']));
+  h.push(selectFilter(3,['sequential','continuous']));
+  h.push(selectFilter(4,['yes','no']));
+  h.push(textFilter(5));
+  h.push(textFilter(6));
+  h.push('</tr></thead><tbody>');
+  qs.forEach(function(q){
+    h.push('<tr data-q="'+esc(q.queueName)+'" data-cf="'+esc(q.confactName)+'">');
+    h.push('<td><a href="'+esc(queueHash(q.queueName,q.confactName))+'">'+esc(q.queueName)+'</a></td>');
+    h.push('<td class="count nowrap"><span class="cnt"></span> <button type="button" class="mini" onclick="countQueue(this)">Count messages</button></td>');
+    h.push('<td data-filter="'+(q.inbound?'inbound':'outbound')+'"><span class="badge '+(q.inbound?'in':'out')+'">'+(q.inbound?'inbound':'outbound')+'</span></td>');
+    h.push('<td>'+(q.sequential?'sequential':'continuous')+'</td>');
+    h.push('<td data-filter="'+(q.errorQueue?'yes':'no')+'">'+(q.errorQueue?'<span class="badge err">yes</span>':'no')+'</td>');
+    h.push('<td>'+esc(q.confactName)+'</td><td>'+esc(q.emailaddr)+'</td></tr>');
+  });
+  h.push('</tbody></table></div></div>');
+  el('view').innerHTML=h.join('');
+  /* show counts that are already known */
+  dataRows(el('qtable')).forEach(function(tr){setCount(tr.querySelector('td.count'),App.counts[tr.getAttribute('data-q')]);});
+}
+function setCount(td,c){
+  var span=td.querySelector('.cnt');span.innerHTML='';
+  if(typeof c==='number'){
+    span.className='cnt '+(c>0?'strong':'muted');span.textContent=c;
+    td.setAttribute('data-sort',c);td.setAttribute('data-filter',c>0?'has messages':'empty');
+  }else if(c&&c.error){
+    span.className='cnt';span.innerHTML='<span class="badge err" title="'+esc(c.error)+'">error</span>';
+    td.setAttribute('data-sort','-1');td.setAttribute('data-filter','error');
+  }else{
+    span.className='cnt';td.setAttribute('data-sort','');td.setAttribute('data-filter','');
+  }
+}
+/* counts one queue row; resolves to the number, or null on error */
+function countRow(tr){
+  var td=tr.querySelector('td.count'),btn=td.querySelector('button'),span=td.querySelector('.cnt'),q=tr.getAttribute('data-q');
+  btn.disabled=true;span.className='cnt muted';span.textContent='...';
+  return api('count',{queuename:q,confactname:tr.getAttribute('data-cf')})
+    .then(function(j){App.counts[q]=j.count;return j.count;})
+    .catch(function(e){App.counts[q]={error:e.message};return null;})
+    .then(function(n){setCount(td,App.counts[q]);btn.disabled=false;return n;});
+}
+function countQueue(btn){countRow(btn.closest('tr')).then(function(){applyFilters('qtable');});}
+function countAll(btn){
+  var rows=dataRows(el('qtable')),i=0,done=0,total=0,errors=0,info=el('countall-info');
+  btn.disabled=true;info.textContent='Counting...';
+  function next(){
+    if(i>=rows.length)return Promise.resolve();
+    var tr=rows[i++];
+    return countRow(tr).then(function(n){
+      if(typeof n==='number'){total+=n;}else{errors++;}
+      done++;info.textContent='Counted '+done+' of '+rows.length+' queues...';
+      return next();
+    });
+  }
+  var workers=[];for(var w=0;w<4;w++){workers.push(next());}
+  Promise.all(workers).then(function(){
+    btn.disabled=false;
+    info.textContent=total+' messages in all queues'+(errors?' ('+errors+' could not be counted)':'');
+    applyFilters('qtable');
+  });
 }
 
-void renderResults(StringBuilder out, String queueName, String confactName, String selector, int maxCount, Map res) {
-	List<Map> msgs = (List<Map>) res.messages
+/* ================= queue page ================= */
+function showQueue(q,cf){
+  if(App.queue!==q){App.selector='';App.maxcount=1;App.countonly=false;App.messages=[];}
+  App.queue=q;
+  App.cf=cf;
+  if(!App.cf){App.queues.forEach(function(x){if(x.queueName===q)App.cf=x.confactName;});}
+  var h=[];
+  h.push('<p><a href="#">&larr; All queues</a></p>');
+  h.push('<div class="card"><h2 class="first">'+esc(q)+'</h2><table class="kv" id="qcfg">');
+  h.push('<tr><th>Messages in queue</th><td><span id="qtotal" class="big muted">...</span> <button type="button" class="mini" onclick="refreshTotal()">Refresh</button></td></tr>');
+  h.push('</table></div>');
+  h.push('<div class="card"><form id="qform" onsubmit="return runQuery()"><div class="toolbar">');
+  h.push('<label><input type="checkbox" id="q-countonly"'+(App.countonly?' checked':'')+'> Count only</label>');
+  h.push('<label>Selector <input type="text" id="q-selector" value="'+esc(App.selector)+'" placeholder="e.g. INTERFACE = &#39;MXASSETInterface&#39;"></label>');
+  h.push('<label>Max count <input type="number" id="q-maxcount" min="-1" value="'+App.maxcount+'"></label>');
+  h.push('<button type="submit" class="primary">Query</button>');
+  h.push('</div><div class="muted">Max count -1 = all messages.</div></form></div>');
+  h.push('<div id="results"></div>');
+  el('view').innerHTML=h.join('');
+  api('queue',{queuename:q}).then(function(j){
+    var t=el('qcfg');if(!t||App.queue!==q)return;
+    var rows='';
+    Object.keys(j.config||{}).forEach(function(k){rows+='<tr><th>'+esc(k)+'</th><td>'+esc(j.config[k])+'</td></tr>';});
+    t.insertAdjacentHTML('beforeend',rows);
+  }).catch(fail);
+  refreshTotal();
+}
+function refreshTotal(){
+  var q=App.queue,s=el('qtotal');if(!s)return;
+  s.className='big muted';s.textContent='...';
+  api('count',{queuename:q,confactname:App.cf}).then(function(j){
+    App.counts[q]=j.count;
+    if(App.queue!==q||!el('qtotal'))return;
+    s.className='big strong';s.textContent=j.count;
+  }).catch(function(e){
+    App.counts[q]={error:e.message};
+    if(App.queue!==q||!el('qtotal'))return;
+    s.className='';s.innerHTML='<span class="badge err">cannot count: '+esc(e.message)+'</span>';
+  });
+}
+/* query form submit: read the form, then load the data */
+function runQuery(){
+  App.selector=el('q-selector').value;
+  App.maxcount=parseInt(el('q-maxcount').value,10);
+  if(isNaN(App.maxcount))App.maxcount=1;
+  App.countonly=el('q-countonly').checked;
+  notify();
+  doQuery();
+  return false;
+}
+/* runs the last query again (used after deleting) */
+function doQuery(){
+  var q=App.queue,r=el('results');if(!r)return Promise.resolve();
+  r.innerHTML='<div class="card muted">Loading...</div>';
+  var p={queuename:q,confactname:App.cf,selector:App.selector};
+  if(App.countonly){
+    return api('count',p).then(function(j){
+      if(App.queue!==q)return;
+      var sel=App.selector.trim();
+      r.innerHTML='<div class="card"><h2 class="first">Count</h2><p class="big"><b>'+j.count+'</b> message(s) in <b>'+esc(q)+'</b>'+
+        (sel?' matching <code>'+esc(sel)+'</code>':'')+'</p></div>';
+    }).catch(function(e){r.innerHTML='';fail(e);});
+  }
+  p.maxcount=App.maxcount;
+  return api('messages',p).then(function(j){
+    if(App.queue!==q)return;
+    renderMessages(j);
+  }).catch(function(e){r.innerHTML='';fail(e);});
+}
 
-	// columns shown in the table; all other properties are only visible with "Show properties"
-	List<String> cols = ["MEAMessageID", "JMSTimestamp", "INTERFACE", "MSG_TRK_EXTSYS", "SENDER"]
-	// values in these columns are links that set the Selector and run the query
-	List<String> FILTER_LINK_COLS = ["MEAMessageID", "INTERFACE", "MSG_TRK_EXTSYS", "SENDER"]   // + JMSMessageID, JMSTimestamp
-	int colspan = 4 + cols.size()
+/* ================= message table ================= */
+function selLiteral(v){return typeof v==='number'?String(v):"'"+String(v).split("'").join("''")+"'";}
+/* cell whose value is a link: click adds "<prop> = <value>" to the Selector and runs the query */
+function linkCell(prop,shown,val,cls){
+  var c=cls?' class="'+cls+'"':'';
+  if(shown===null||shown===undefined||shown===''||val===null||val===undefined||val===''){return '<td'+c+'>'+esc(shown)+'</td>';}
+  var cond=prop+' = '+selLiteral(val);
+  return '<td'+c+' data-sort="'+esc(shown)+'" data-filter="'+esc(shown)+'"><a href="#" class="flt" data-cond="'+esc(cond)+
+    '" title="Query messages with '+esc(cond)+'" onclick="return filterLike(this)">'+esc(shown)+'</a></td>';
+}
+function filterLike(a){
+  var cond=a.getAttribute('data-cond'),sel=el('q-selector'),cur=sel.value.trim();
+  if(cur.indexOf(cond)<0){sel.value=cur?'('+cur+') AND '+cond:cond;}
+  el('q-countonly').checked=false;
+  runQuery();
+  return false;
+}
+function renderMessages(j){
+  var msgs=j.messages||[],h=[],colspan=4+COLS.length;
+  App.messages=msgs;
+  h.push('<div class="card" data-table="mtable"><h2 class="first">Messages</h2>');
+  h.push('<div class="muted">Showing '+msgs.length+' message(s)'+(j.more?' &ndash; more messages match, raise <i>Max count</i> to see them':'')+'.</div>');
+  if(!msgs.length){el('results').innerHTML=h.join('')+'</div>';return;}
+  h.push('<div class="toolbar">');
+  h.push('<button type="button" onclick="downloadDisplayed()">Download displayed messages (zip)</button>');
+  h.push('<button type="button" class="danger" onclick="deleteSelected()">Delete selected messages</button>');
+  h.push('<button type="button" class="danger" onclick="deleteDisplayed()">Delete all displayed messages</button>');
+  h.push('</div><div class="toolbar">');
+  h.push('<b id="mtable-count" data-noun="messages">'+msgs.length+' of '+msgs.length+' messages</b>');
+  h.push(searchBox('mtable','Search columns, properties and message content...',300));
+  h.push('</div>');
+  h.push('<div class="scroll"><table id="mtable" class="ft"><thead><tr>');
+  h.push('<th class="shrink"><input type="checkbox" title="Select all visible" onclick="setAll(this)"></th>');
+  h.push(sortTh('#','shrink')+'<th class="shrink">Actions</th>'+sortTh('JMSMessageID'));
+  COLS.forEach(function(c){h.push(sortTh(c));});
+  h.push('</tr><tr class="filters"><th></th>'+textFilter(1,'num','#')+'<th></th>');
+  for(var k=0;k<=COLS.length;k++){h.push(textFilter(3+k));}
+  h.push('</tr></thead><tbody>');
+  msgs.forEach(function(m,i){
+    var props=m.props||{};
+    h.push('<tr data-idx="'+i+'" data-id="'+esc(m.id)+'"><td><input type="checkbox" name="msgid" value="'+esc(m.id)+'"></td>');
+    h.push('<td>'+(i+1)+'</td><td class="nowrap">');
+    h.push('<button type="button" data-d="body" data-l="message" onclick="toggleDetail(this)">Show message</button> ');
+    h.push('<button type="button" data-d="props" data-l="properties" onclick="toggleDetail(this)">Show properties</button> ');
+    h.push('<button type="button" onclick="downloadRow(this)">Download</button> ');
+    h.push('<button type="button" class="danger" onclick="deleteRow(this)">Delete</button></td>');
+    h.push(linkCell('JMSMessageID',m.id,m.id,'nowrap'));
+    COLS.forEach(function(c){
+      var v=props[c];
+      if(c==='JMSTimestamp'){h.push(linkCell(c,v,m.ts>0?m.ts:null,'nowrap'));}  /* selector needs the milliseconds */
+      else if(LINK_COLS.indexOf(c)>=0){h.push(linkCell(c,v,v,null));}
+      else{h.push('<td>'+esc(v)+'</td>');}
+    });
+    h.push('</tr>');
+    var pr='';
+    Object.keys(props).forEach(function(k){pr+='<tr><th>'+esc(k)+'</th><td>'+esc(props[k])+'</td></tr>';});
+    h.push('<tr class="detail d-props" hidden><td colspan="'+colspan+'"><table class="kv props">'+pr+'</table></td></tr>');
+    h.push('<tr class="detail d-body" hidden><td colspan="'+colspan+'"><pre>'+esc(m.body)+'</pre></td></tr>');
+  });
+  h.push('</tbody></table></div></div>');
+  el('results').innerHTML=h.join('');
+}
+function toggleDetail(btn){
+  var tr=btn.closest('tr'),d=detailsOf(tr),kind='d-'+btn.getAttribute('data-d');
+  for(var i=0;i<d.length;i++){
+    if(d[i].classList.contains(kind)){
+      d[i].hidden=!d[i].hidden;
+      btn.textContent=(d[i].hidden?'Show ':'Hide ')+btn.getAttribute('data-l');
+    }
+  }
+}
+function setAll(cb){
+  var rows=dataRows(cb.closest('table'));
+  for(var i=0;i<rows.length;i++){var c=rows[i].querySelector('input[name=msgid]');if(c)c.checked=cb.checked&&rows[i].style.display!=='none';}
+}
+function visibleRows(){return dataRows(el('mtable')).filter(function(r){return r.style.display!=='none';});}
 
-	out.append('<div class="card"><h2 style="margin-top:0">Messages</h2>')
-	out.append('<div class="muted">Showing ').append(msgs.size()).append(' message(s)')
-	if (res.more) out.append(' &ndash; more messages match, raise <i>Max count</i> to see them')
-	out.append('.</div>')
+/* ================= delete (POST, the page stays) ================= */
+function deleteRow(btn){doDelete([btn.closest('tr').getAttribute('data-id')],'Delete this message from the queue?');}
+function deleteSelected(){
+  var ids=[],c=el('mtable').querySelectorAll('input[name=msgid]:checked');
+  for(var i=0;i<c.length;i++){ids.push(c[i].value);}
+  if(!ids.length){alert('No messages selected.');return;}
+  doDelete(ids,'Delete the '+ids.length+' selected messages from the queue?');
+}
+function deleteDisplayed(){
+  var ids=visibleRows().map(function(r){return r.getAttribute('data-id');});
+  if(!ids.length){alert('No messages displayed.');return;}
+  doDelete(ids,'Delete all '+ids.length+' displayed messages from the queue?');
+}
+function doDelete(ids,question){
+  if(!confirm(question))return;
+  api('delete',{queuename:App.queue,id:ids},true).then(function(d){
+    var nf=d.notFound||[],fl=d.failed||[];
+    var t='Deleted '+d.deleted+' of '+ids.length+' message(s).';
+    if(nf.length)t+=' Not found (already processed or deleted): '+nf.join(', ');
+    if(fl.length)t+=' Failed: '+fl.join('; ');
+    notify(t,!nf.length&&!fl.length);
+    refreshTotal();
+    doQuery();
+  }).catch(fail);
+}
 
-	if (msgs.isEmpty()) { out.append('</div>'); return }
-
-	out.append('<form method="post" action="">')
-	out.append('<input type="hidden" id="act" name="action" value="query">')
-	out.append('<input type="hidden" name="queuename" value="').append(esc(queueName)).append('">')
-	out.append('<input type="hidden" name="confactname" value="').append(esc(confactName)).append('">')
-	out.append('<input type="hidden" name="selector" value="').append(esc(selector)).append('">')
-	out.append('<input type="hidden" name="maxcount" value="').append(maxCount).append('">')
-	// "allid" inputs for "Delete all displayed" are added by JavaScript from the rows that are currently visible
-
-	out.append('<div class="toolbar">')
-	out.append('<button type="button" data-zip="').append(esc(safeFileName(queueName.replace('/', '.')) + ".zip"))
-	out.append('" onclick="downloadDisplayed(this)">Download displayed messages (zip)</button>')
-	out.append('<button type="submit" class="danger" onclick="return doAct(\'deleteselected\',\'Delete the selected messages from the queue?\')">Delete selected messages</button>')
-	out.append('<button type="submit" class="danger" onclick="return doAct(\'deleteall\',\'\')">Delete all displayed messages</button>')
-	out.append('</div>')
-	out.append('<div class="toolbar">')
-	out.append('<b id="mtable-count" data-noun="messages">').append(msgs.size()).append(' of ').append(msgs.size()).append(' messages</b>')
-	out.append('<input type="text" id="mtable-global" placeholder="Search columns, properties and message content..." oninput="applyFilters(\'mtable\')" style="width:300px">')
-	out.append('<button type="button" onclick="clearFilters(\'mtable\')">Clear filters</button>')
-	out.append('</div>')
-
-	out.append('<div class="scroll"><table id="mtable" class="ft"><thead><tr>')
-	out.append('<th class="shrink"><input type="checkbox" title="Select all visible" onclick="setAll(this)"></th>')
-	out.append('<th class="sortable shrink" onclick="sortTable(this)">#</th><th class="shrink">Actions</th>')
-	out.append('<th class="sortable" onclick="sortTable(this)">JMSMessageID</th>')
-	cols.each { c -> out.append('<th class="sortable" onclick="sortTable(this)">').append(esc(c)).append('</th>') }
-	out.append('</tr><tr class="filters"><th></th>')
-	out.append('<th><input type="text" class="num" data-col="1" placeholder="#" oninput="applyFilters(\'mtable\')"></th><th></th>')
-	int fc = 3
-	for (int k = 0; k <= cols.size(); k++) {
-		out.append('<th><input type="text" data-col="').append(fc + k).append('" placeholder="contains..." oninput="applyFilters(\'mtable\')"></th>')
-	}
-	out.append('</tr></thead><tbody>')
-
-	int i = 0
-	for (Map m : msgs) {
-		i++
-		String rowId = "body" + i
-		String propId = "props" + i
-		Map props = (Map) m.props
-		out.append('<tr data-id="').append(esc(m.id)).append('" data-body="').append(rowId)
-		out.append('" data-file="').append(esc(messageFileName(props, m.id.toString()))).append('"><td><input type="checkbox" name="msgid" value="').append(esc(m.id)).append('"></td>')
-		out.append('<td>').append(i).append('</td>')
-		out.append('<td class="nowrap">')
-		out.append('<button type="button" onclick="toggleRow(\'').append(rowId).append('\',this,\'message\')">Show message</button> ')
-		out.append('<button type="button" onclick="toggleRow(\'').append(propId).append('\',this,\'properties\')">Show properties</button> ')
-		out.append('<button type="button" onclick="downloadRow(this)">Download</button> ')
-		out.append('<button type="submit" class="danger" name="rowid" value="').append(esc(m.id))
-		out.append('" onclick="return doAct(\'deleterow\',\'Delete this message from the queue?\')">Delete</button></td>')
-		filterCell(out, "JMSMessageID", m.id, m.id, "nowrap")
-		cols.each { c ->
-			def v = props.get(c)
-			if (c == "JMSTimestamp") {
-				// shown formatted, but the selector needs the long value in milliseconds
-				filterCell(out, c, v, m.ts, "nowrap")
-			} else if (c in FILTER_LINK_COLS) {
-				filterCell(out, c, v, v, null)
-			} else {
-				out.append('<td>').append(esc(v)).append('</td>')
-			}
-		}
-		out.append('</tr>')
-		// all properties (detail row)
-		out.append('<tr id="').append(propId).append('" class="detail" hidden><td colspan="').append(colspan).append('">')
-		out.append('<table class="kv props">')
-		props.each { k, v -> out.append('<tr><th>').append(esc(k)).append('</th><td>').append(esc(v)).append('</td></tr>') }
-		out.append('</table></td></tr>')
-		// message body (detail row)
-		out.append('<tr id="').append(rowId).append('" class="detail" hidden><td colspan="').append(colspan).append('"><pre>')
-		out.append(esc(m.body)).append('</pre></td></tr>')
-	}
-	out.append('</tbody></table></div></form></div>')
+/* ================= downloads (built in the browser from the loaded messages) ================= */
+function saveBlob(blob,name){
+  var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+  document.body.appendChild(a);a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);a.parentNode.removeChild(a);},1000);
+}
+function msgOf(tr){return App.messages[parseInt(tr.getAttribute('data-idx'),10)];}
+function downloadRow(btn){
+  var m=msgOf(btn.closest('tr'));
+  saveBlob(new Blob([m.body||''],{type:'application/xml'}),m.file||'message.xml');
+}
+var CRC_T=null;
+function crc32(u){
+  if(!CRC_T){CRC_T=new Uint32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++){c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);}CRC_T[n]=c>>>0;}}
+  var x=0xFFFFFFFF;for(var i=0;i<u.length;i++){x=CRC_T[(x^u[i])&255]^(x>>>8);}return (x^0xFFFFFFFF)>>>0;
+}
+/* minimal zip writer (no compression); files=[{name:'a.xml',data:Uint8Array}] */
+function makeZip(files){
+  var enc=new TextEncoder(),parts=[],central=[],off=0;
+  function u16(v){return [v&255,(v>>>8)&255];}
+  function u32(v){return [v&255,(v>>>8)&255,(v>>>16)&255,(v>>>24)&255];}
+  for(var i=0;i<files.length;i++){
+    var f=files[i],nm=enc.encode(f.name),crc=crc32(f.data),sz=f.data.length;
+    var common=[].concat(u16(0x0800),u16(0),u16(0),u16(0x21),u32(crc),u32(sz),u32(sz),u16(nm.length),u16(0));
+    var lh=new Uint8Array([0x50,0x4b,3,4].concat(u16(20),common));
+    parts.push(lh,nm,f.data);
+    central.push(new Uint8Array([0x50,0x4b,1,2].concat(u16(20),u16(20),common,u16(0),u16(0),u16(0),u32(0),u32(off))),nm);
+    off+=lh.length+nm.length+sz;
+  }
+  var cs=0;for(var j=0;j<central.length;j++){cs+=central[j].length;}
+  var end=new Uint8Array([0x50,0x4b,5,6].concat(u16(0),u16(0),u16(files.length),u16(files.length),u32(cs),u32(off),u16(0)));
+  return new Blob(parts.concat(central,[end]),{type:'application/zip'});
+}
+function downloadDisplayed(){
+  var rows=visibleRows(),enc=new TextEncoder(),files=[],used={};
+  rows.forEach(function(tr){
+    var m=msgOf(tr),base=m.file||'message.xml',name=base,n=1;
+    var stem=base.slice(-4).toLowerCase()==='.xml'?base.slice(0,-4):base;
+    while(used[name]){n++;name=stem+'_'+n+'.xml';}
+    used[name]=true;
+    files.push({name:name,data:enc.encode(m.body||'')});
+  });
+  if(!files.length){alert('No messages displayed.');return;}
+  saveBlob(makeZip(files),App.queue.split('/').join('.').replace(/[^A-Za-z0-9._-]/g,'_')+'.zip');
+}
+'''
 }
 
 // ---------------------------------------------------------------- main
 
-List<String> debugInfo = []
-Map<String, List<String>> params = readParams(debugInfo)
-
-// static resources requested by the page itself: ?resource=css / ?resource=js
+Map<String, List<String>> params = readParams()
 String resource = p1(params, "resource", "").trim().toLowerCase()
+
 if (resource == "css") {
 	responseHeaders.put("content-type", "text/css")
 	responseBody = cssCode()
-	return
-}
-if (resource == "js") {
+} else if (resource == "js") {
 	responseHeaders.put("content-type", "application/javascript")
 	responseBody = jsCode()
-	return
-}
-
-// count of one queue as JSON, used by the "Count messages" button in the queue list
-if (p1(params, "action", "").trim().toLowerCase() == "countqueue") {
-	String q = p1(params, "queuename", "").trim()
-	String cf = p1(params, "confactname", "").trim()
-	if ((cf.isEmpty() || cf == "null") && !q.isEmpty()) cf = parseCfg(MaxQueueCache.getInstance().getQueueConfig(q)).get("confactName")
+} else if (resource == "json") {
 	responseHeaders.put("content-type", "application/json")
+	def result
 	try {
-		responseBody = groovy.json.JsonOutput.toJson([queue: q, count: browse(q, cf, null, -1, true).total])
+		result = handleJson(params)
 	} catch (Throwable t) {
-		service.log_error("JMSMESSAGEADMIN: cannot count messages in " + q + ": " + t)
-		responseBody = groovy.json.JsonOutput.toJson([queue: q, error: t.toString()])
+		service.log_error("JMSMESSAGEADMIN: " + p1(params, "op", "") + " failed: " + t)
+		result = [error: t.toString()]
 	}
-	return
+	responseBody = JsonOutput.toJson(result)
+} else {
+	responseHeaders.put("content-type", "text/html")
+	responseBody = pageHtml()
 }
-boolean debug = "1".equals(p1(params, "debug", "")) || "true".equalsIgnoreCase(p1(params, "debug", ""))
-String queueName = p1(params, "queuename", "").trim()
-String confactName = p1(params, "confactname", "").trim()
-if ((confactName.isEmpty() || confactName == "null") && !queueName.isEmpty()) {
-	// not passed (e.g. URL typed by hand) -> take it from the queue configuration
-	String cfgCf = parseCfg(MaxQueueCache.getInstance().getQueueConfig(queueName)).get("confactName")
-	confactName = cfgCf == null ? "" : cfgCf
-}
-String action = p1(params, "action", "").trim().toLowerCase()
-String selector = p1(params, "selector", "")
-boolean countOnly = "true".equalsIgnoreCase(p1(params, "countonly", "false")) || "on".equalsIgnoreCase(p1(params, "countonly", ""))
-int maxCount = 1
-try { maxCount = Integer.parseInt(p1(params, "maxcount", "1").trim()) } catch (Exception e) { maxCount = 1 }
-
-StringBuilder out = new StringBuilder()
-out.append('<h1>').append(esc(SCRIPT_TITLE)).append(' <span class="muted" style="font-size:12px;font-weight:normal">user: ')
-out.append(esc(userInfo.getUserName())).append('</span></h1>')
-
-try {
-	if (queueName.isEmpty()) {
-		renderQueueList(out, action == "countall")
-	} else {
-		if (action.startsWith("delete")) countOnly = false
-		boolean configured = MaxQueueCache.getInstance().getQueueConfig(queueName) != null
-
-		// 1) deletions first, so the total count below is already up to date
-		StringBuilder banner = new StringBuilder()
-		if (configured && action.startsWith("delete")) {
-			List<String> ids
-			if (action == "deleterow") ids = pAll(params, "rowid")
-			else if (action == "deleteselected") ids = pAll(params, "msgid")
-			else if (action == "deleteall") ids = pAll(params, "allid")
-			else ids = []
-
-			if (ids.isEmpty()) {
-				banner.append('<div class="msg bad">No messages to delete.</div>')
-			} else {
-				Map d = deleteMessages(queueName, ids)
-				service.log_info("JMSMESSAGEADMIN: user " + userInfo.getUserName() + " deleted " + d.deleted + " message(s) from " + queueName + ": " + ids)
-				boolean allOk = d.notFound.isEmpty() && d.failed.isEmpty()
-				banner.append('<div class="msg ').append(allOk ? "ok" : "bad").append('">Deleted ')
-				banner.append(d.deleted).append(' of ').append(ids.size()).append(' message(s).')
-				if (!d.notFound.isEmpty()) {
-					banner.append(' Not found (already processed or deleted): ').append(esc(d.notFound.join(", ")))
-				}
-				if (!d.failed.isEmpty()) {
-					banner.append('<br>Failed: ').append(esc(d.failed.join("; ")))
-				}
-				banner.append('</div>')
-			}
-		}
-
-		// 2) total number of messages in the queue (no selector), shown with the queue info
-		String totalHtml = null
-		if (configured) {
-			try {
-				totalHtml = '<b>' + browse(queueName, confactName, null, -1, true).total + '</b>'
-			} catch (Throwable t) {
-				service.log_error("JMSMESSAGEADMIN: cannot count messages in " + queueName + ": " + t)
-				totalHtml = '<span class="badge err">cannot count: ' + esc(t.toString()) + '</span>'
-			}
-		}
-
-		renderQueueHeader(out, queueName, confactName, selector, maxCount, countOnly, totalHtml)
-		out.append(banner)
-
-		if (configured && action) {
-			Map res = browse(queueName, confactName, selector, maxCount, countOnly)
-			debugInfo.add("browse: queue=" + queueName + ", cf=" + confactName + ", selector=[" + selector + "], maxCount=" + maxCount
-					+ ", countOnly=" + countOnly + " -> total=" + res.total + ", listed=" + ((List) res.messages).size() + ", more=" + res.more)
-			if (countOnly) {
-				out.append('<div class="card"><h2 style="margin-top:0">Count</h2><p style="font-size:18px"><b>')
-				out.append(res.total).append('</b> message(s) in <b>').append(esc(queueName)).append('</b>')
-				if (selector?.trim()) out.append(' matching <code>').append(esc(selector.trim())).append('</code>')
-				out.append('</p></div>')
-			} else {
-				renderResults(out, queueName, confactName, selector, maxCount, res)
-			}
-		}
-	}
-} catch (Throwable t) {
-	service.log_error("JMSMESSAGEADMIN failed: " + t)
-	StringWriter sw = new StringWriter()
-	t.printStackTrace(new PrintWriter(sw))
-	out.append('<div class="msg bad"><b>Error:</b> ').append(esc(t.toString())).append('</div>')
-	out.append('<details><summary>Stack trace</summary><pre>').append(esc(sw.toString())).append('</pre></details>')
-}
-
-if (debug) {
-	debugInfo.add("action=[" + action + "], queueName=[" + queueName + "], confactName=[" + confactName + "], countOnly=" + countOnly + ", maxCount=" + maxCount)
-	out.append('<details open class="card"><summary><b>Debug</b></summary><pre>').append(esc(debugInfo.join("\n"))).append('</pre></details>')
-	service.log_info("JMSMESSAGEADMIN debug:\n" + debugInfo.join("\n"))
-}
-
-responseHeaders.put("content-type", "text/html")
-responseBody = pageStart(SCRIPT_TITLE) + out.toString() + pageEnd()

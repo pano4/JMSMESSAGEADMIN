@@ -2,7 +2,7 @@
 
 Maximo script to browse and delete JMS queue messages.
 
-`JMSMESSAGEADMIN` is a Groovy automation script for IBM Maximo / Maximo Manage. It serves a small web page that lists the integration (MIF) JMS queues configured in Maximo. From there you can count, inspect and delete the messages in each queue, for example to clean up `cqinerr` or check what is stuck in a sequential queue.
+`JMSMESSAGEADMIN` is a Groovy automation script for IBM Maximo / Maximo Manage. It serves a single-page web app that lists the integration (MIF) JMS queues configured in Maximo. From there you can count, inspect and delete the messages in each queue, for example to clean up `cqinerr` or check what is stuck in a sequential queue.
 
 ## Features
 
@@ -11,11 +11,13 @@ Maximo script to browse and delete JMS queue messages.
   - Click a column header to sort by it. Filtering and sorting happen in the browser, without calling the server again.
   - **Count messages in all queues** counts the messages in every queue (without a selector) and shows the numbers in a *Messages* column, which you can sort and filter (has messages / empty / error).
   - Each queue also has its own **Count messages** button, which counts just that queue and updates its cell without reloading the page.
-- **Queue page:** shows the total number of messages in the queue (counted straight away, without a selector), the queue's configuration and a query form:
+- **Queue page:** shows the total number of messages in the queue (counted straight away, without a selector, with a **Refresh** button), the queue's configuration and a query form:
   - **Count only:** shows how many messages match.
   - **Selector:** a standard JMS message selector, for example `INTERFACE = 'MXASSETInterface'`.
   - **Max count:** how many messages to list (`-1` lists all of them).
-- **Message table:** one row per message, with the JMS headers and a column for every message property (`MEAMessageID`, `INTERFACE`, `SENDER`, …).
+- **Message table:** one row per message, with the columns JMSMessageID, MEAMessageID, JMSTimestamp, INTERFACE, MSG_TRK_EXTSYS and SENDER.
+  - Clicking one of these values adds it to the Selector (for example `INTERFACE = 'MXASSETInterface'`) and runs the query again.
+  - **Show properties** shows all JMS headers and message properties of a message.
   - Each column has a filter, and a search box covers all columns plus the message body.
   - Click a column header to sort by it. As with the queue list, this happens in the browser.
   - **Download** saves the message body as `SENDER_INTERFACE_MEAMessageID.xml`, and **Download displayed messages (zip)** saves all visible messages in one zip file. Both are built in the browser.
@@ -27,6 +29,8 @@ Maximo script to browse and delete JMS queue messages.
 - Every deletion is written to the Maximo log, with the user name and the message IDs.
 
 ## How it works
+
+The page is loaded only once. The first request returns a minimal HTML page, which loads the stylesheet (`resource=css`) and the JavaScript (`resource=js`) from the same script. The JavaScript builds the whole user interface, and every later action (listing queues, counting, querying, deleting) is a JSON data request to the script (`resource=json`). You always stay on the same page; the browser's address only changes after the `#`, so the back button and bookmarks of a queue still work.
 
 The script talks to the queues with plain JMS calls: it looks up the queue and its connection factory through JNDI (`InitialContext`), and reads messages with a `QueueBrowser`. Messages are deleted with Maximo's own MIC service, `MicServiceRemote.deleteQueueData(queueName, "JMSMessageID = '<id>'", 1, null)`, one call per message. It does not use `psdi.iface.jms.JMSQueueBrowser`, and it does not write files to the global directory.
 
@@ -59,19 +63,22 @@ https://<host>/maximo/api/script/JMSMESSAGEADMIN
 
 On older 7.6 systems, use `https://<host>/maximo/oslc/script/JMSMESSAGEADMIN` instead.
 
-| Parameter | Description |
-|---|---|
-| *(none)* | Shows the list of queues. |
-| `queuename` | The queue's JNDI name, for example `jms/maximo/int/queues/cqinerr`. Opens that queue's page. |
-| `confactname` | The connection factory. The queue list fills it in, and if it's missing the script reads it from the queue's configuration. |
-| `action` | `query`, `deleterow`, `deleteselected` or `deleteall` on a queue page; `countall` on the queue list; `countqueue` (with `queuename`) returns only that queue's count as JSON. |
-| `selector` | A JMS message selector (optional). |
-| `maxcount` | How many messages to list. Defaults to `1`; `-1` lists all. |
-| `countonly` | `true` shows only the number of matching messages. |
-| `resource` | `css` returns only the page's stylesheet and `js` only its JavaScript. The page loads both with its own requests. |
-| `debug` | `1` shows the received request parameters and the query result at the bottom of the page, and writes them to the Maximo log. |
+To open a queue directly, add its name after the `#`, for example `…/JMSMESSAGEADMIN#queue=jms%2Fmaximo%2Fint%2Fqueues%2Fcqinerr`.
 
-Queries and deletions are sent as form POSTs to the same script URL.
+### Requests
+
+| Request | Returns |
+|---|---|
+| *(no parameters)* | The minimal HTML page. |
+| `resource=css` | The stylesheet. |
+| `resource=js` | The JavaScript. |
+| `resource=json&op=queues` | All queues and the user name. |
+| `resource=json&op=queue&queuename=…` | The configuration of one queue. |
+| `resource=json&op=count&queuename=…[&selector=…]` | The number of (matching) messages. |
+| `resource=json&op=messages&queuename=…&selector=…&maxcount=…` | The messages with headers, properties and body. `maxcount` `-1` returns all. |
+| `resource=json&op=delete&queuename=…&id=…&id=…` | Deletes the messages with these JMSMessageIDs. Must be a POST. |
+
+All JSON requests also accept `confactname`; without it, the script takes the connection factory from the queue's configuration. On failure they return `{"error": "…"}`, which the page shows at the top.
 
 ## Notes
 
